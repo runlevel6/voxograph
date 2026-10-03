@@ -18,6 +18,10 @@ On my M2 MacBook Pro, on CPU, it takes about 1 hour, at a rate of about 60 chara
 
 This fork adds significant architectural improvements over the original project:
 
+- **Second TTS engine: Chatterbox Multilingual V3 (voice cloning)** — the GUI can synthesize the whole book with [Chatterbox](https://github.com/resemble-ai/chatterbox) instead of Kokoro. Because Chatterbox degrades on long inputs, chapters are split into ~300-character chunks at sentence (then clause, then word) boundaries and stitched back together, and the model is loaded **once per run** through a persistent bridge process, so the multi-second load is paid a single time instead of once per chapter. See [Second TTS engine: Chatterbox](#second-tts-engine-chatterbox).
+
+- **Named Chatterbox voices via a Kokoro-rendered sample library** — Chatterbox has no named voice list, so audiblez renders every Kokoro voice once into `~/.audiblez/voice_samples/<voice>.wav` (edge silence trimmed, peak normalized) and hands it to Chatterbox as the cloning prompt. The preset name is therefore the Kokoro voice name, and one dropdown serves both engines. **Build Sample** renders the selected voice in the background, **Build All** renders every voice in the dropdown, or switch the source to **Custom WAV** to clone a recording of your own. The same library is available headlessly via `python -m audiblez.voice_samples_cli --list | --voice af_heart | --all`.
+
 - **AI-Assisted Pronunciation Correction (Gemini)** — the flagship feature of this release. When **AI Phonetic Check** is enabled, each chapter is rewritten by Google Gemini *before* synthesis so Kokoro pronounces tricky words correctly. The model expands abbreviations (`Dr.` → `Doctor`, `NASA` → `N A S A`), spells out numbers and dates (`2024` → `twenty twenty four`, `3rd` → `third`), re-spells homophones and silent letters, and **always** rewrites foreign proper nouns — personal names, place names, military units — into an English-friendly spelling or an inline IPA override with stress marks (e.g. `Péronne` → `Peyron`). Plain English respelling is preferred when it is simpler and just as accurate; punctuation is preserved because it shapes prosody.
 
 - **Full-pipeline, chunked AI rewriting** — the AI step runs on the *entire book* during synthesis, not just on a preview snippet. Chapters that already have a WAV file on disk are skipped without any API call, and very long chapters are rewritten in chunks of roughly 300K tokens each, with live per-chunk progress shown in the GUI.
@@ -90,6 +94,53 @@ Then you can run the GUI with:
 ```
 audiblez-ui
 ```
+
+
+## Second TTS engine: Chatterbox
+
+Besides Kokoro, the GUI can synthesize the book with **Chatterbox Multilingual V3**, which clones
+a voice from a short reference recording. Select it in the **TTS Engine** radio of the
+*Audiobook Parameters* panel; the choice is stored in `config.json` (`tts_engine`) and is also what
+the command-line tool uses.
+
+Chatterbox is installed in a **separate virtualenv**, because it pins `torch==2.6.0` while audiblez
+needs a different build, and audiblez talks to it over a small bridge script:
+
+```bash
+python3 -m venv ~/chatterbox_venv
+~/chatterbox_venv/bin/pip install torch==2.6.0 torchaudio==2.6.0 chatterbox-tts==0.1.7
+```
+
+The bridge script lives at `<venv>/generate.py` and is shipped in this repo as
+[`chatterbox_bridge/generate.py`](chatterbox_bridge/generate.py) — copy it there:
+
+```bash
+cp chatterbox_bridge/generate.py ~/chatterbox_venv/generate.py
+```
+
+It reads one JSON request on stdin and writes one JSON result on stdout; in `--serve` mode it loops
+over newline-delimited requests so a whole book is synthesized with a single model load. Its location
+is baked into `audiblez/core.py` (`CHATTERBOX_BRIDGE_DIR`) and can be overridden with the
+`AUDIBLEZ_CHATTERBOX_BRIDGE_DIR` environment variable.
+
+Note that Multilingual V3 needs a `t3_model="t3_mtl23ls_v3.safetensors"` argument on
+`ChatterboxMultilingualTTS.from_pretrained()`, which stock `chatterbox-tts==0.1.7` does not accept —
+add the parameter (and thread it through `from_local()`) in your venv.
+
+Then pick the voice to clone:
+
+- **Voice Preset** — clones `~/.audiblez/voice_samples/<voice>.wav`, a Kokoro rendering of the voice
+  selected in the dropdown. Missing presets are built automatically (or with **Build Sample** /
+  **Build All**, or `python -m audiblez.voice_samples_cli --all`).
+- **Custom WAV** — clones a recording you supply.
+
+Both engines then share the rest of the pipeline: chapter WAV caching, normalization, single-pass
+ffmpeg M4B encoding and AI phonetic correction. The AI rewrite rules are engine-aware — Kokoro gets
+inline IPA overrides, Chatterbox gets plain-English respelling only, since Chatterbox does not read
+IPA. Chapter WAVs are tagged per engine, so switching engines never reuses the other engine's audio.
+
+Chatterbox Multilingual V3 is English-locked in this configuration, and it is noticeably slower than
+Kokoro — expect a fraction of Kokoro's characters-per-second.
 
 
 ## How to run on Windows

@@ -7,7 +7,9 @@
 import os
 import traceback
 import uuid
+import tempfile
 from glob import glob
+from queue import Queue, Empty
 import json
 
 import torch.cuda
@@ -40,6 +42,11 @@ _AAC_ENCODE_RT_FACTOR = 50    # ffmpeg aac runs ~50x realtime
 # regardless of where the process is launched from.
 CONFIG_FILE = Path(__file__).parent / 'config.json'
 
+# Default home for the rendered voice samples (one WAV per Kokoro voice) that
+# Chatterbox clones from. Kept outside the package directory on purpose: a
+# pip reinstall of audiblez wipes site-packages but must not wipe samples.
+DEFAULT_VOICE_SAMPLES_DIR = Path.home() / '.audiblez' / 'voice_samples'
+
 
 # ---------------------------------------------------------------------------
 # Settings  (fix #9: single source of truth — UI imports from here)
@@ -56,12 +63,17 @@ def load_settings():
             settings.setdefault('gemini_model', 'gemini-3.1-flash-lite')
             settings.setdefault('gemini_enabled', False)
             settings.setdefault('last_open_dir', str(Path.home()))
+            settings.setdefault('tts_engine', 'kokoro')
+            settings.setdefault('chatterbox_ref_audio', '')
+            settings.setdefault('chatterbox_device', 'cuda')
+            settings.setdefault('chatterbox_voice_source', 'preset')
+            settings.setdefault('voice_samples_dir', str(DEFAULT_VOICE_SAMPLES_DIR))
             return settings
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
-def save_settings(output_folder, voice, speed=1.0, gemini_api_key='', gemini_model='gemini-3.1-flash-lite', gemini_enabled=False, last_open_dir=''):
+def save_settings(output_folder, voice, speed=1.0, gemini_api_key='', gemini_model='gemini-3.1-flash-lite', gemini_enabled=False, last_open_dir='', tts_engine='kokoro', chatterbox_ref_audio='', chatterbox_device='cuda', chatterbox_voice_source='preset', voice_samples_dir=''):
     """
     Saves settings to the JSON configuration file.
     Accepts an optional speed parameter so both core and UI write a
@@ -75,6 +87,11 @@ def save_settings(output_folder, voice, speed=1.0, gemini_api_key='', gemini_mod
         'gemini_model': gemini_model,
         'gemini_enabled': gemini_enabled,
         'last_open_dir': last_open_dir,
+        'tts_engine': tts_engine,
+        'chatterbox_ref_audio': chatterbox_ref_audio,
+        'chatterbox_device': chatterbox_device,
+        'chatterbox_voice_source': chatterbox_voice_source,
+        'voice_samples_dir': voice_samples_dir or str(DEFAULT_VOICE_SAMPLES_DIR),
     }
     try:
         with open(CONFIG_FILE, 'w') as f:
@@ -520,7 +537,8 @@ def _call_gemini_with_retry(func, *args, stop_event=None, post_event=None, **kwa
 
 
 def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
-         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None, stop_event=None):
+         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None,
+         stop_event=None, tts_engine=None):
     if post_event:
         post_event('CORE_STARTED')
 
@@ -600,92 +618,148 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
     eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
     print(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
 
-    set_espeak_library()
-    try:
-        pipeline = KPipeline(lang_code=lang_code_from_voice(voice))  # fix #5
-    except Exception as e:
-        print(f'\033[91mFailed to initialize the Kokoro TTS pipeline: {e}\033[0m')
-        if post_event:
-            post_event('CORE_ERROR', message=f'Failed to initialize TTS pipeline: {e}')
-        raise
+    tts_engine = tts_engine or settings.get('tts_engine', 'kokoro')
+    if tts_engine not in ('kokoro', 'chatterbox'):
+        tts_engine = 'kokoro'
+    print(f'TTS engine: {tts_engine}')
+
+    pipeline = None
+    bridge = None
+    if tts_engine == 'chatterbox':
+        source = settings.get('chatterbox_voice_source', 'preset')
+        custom_ref = settings.get('chatterbox_ref_audio', '') or ''
+        ref_audio = resolve_chatterbox_ref_audio(voice, source, custom_ref, settings)
+        if not ref_audio and source == 'preset':
+            print(f'Chatterbox voice preset for {voice} is not built yet — '
+                  f'rendering it with Kokoro first...')
+            set_espeak_library()
+            built = generate_voice_sample(voice, settings=settings, stop_event=stop_event)
+            if built:
+                ref_audio = str(built)
+        if not ref_audio:
+            msg = ('Chatterbox needs a reference audio clip to clone for the selected '
+                   'voice. Build the voice preset (or pick a custom WAV) and try again.')
+            print('\033[91m' + msg + '\033[0m')
+            if post_event:
+                post_event('CORE_ERROR', message=msg)
+            return
+        print(f'Chatterbox clone source: {ref_audio}')
+        try:
+            bridge = ChatterboxBridge(
+                device=settings.get('chatterbox_device', 'cuda'), ref_audio=ref_audio)
+        except Exception as e:
+            print(f'\033[91mFailed to start the Chatterbox bridge: {e}\033[0m')
+            if post_event:
+                post_event('CORE_ERROR', message=f'Failed to start Chatterbox bridge: {e}')
+            raise
+    else:
+        set_espeak_library()
+        try:
+            pipeline = KPipeline(lang_code=lang_code_from_voice(voice))  # fix #5
+        except Exception as e:
+            print(f'\033[91mFailed to initialize the Kokoro TTS pipeline: {e}\033[0m')
+            if post_event:
+                post_event('CORE_ERROR', message=f'Failed to initialize TTS pipeline: {e}')
+            raise
 
     chapter_wav_files = []
-    for i, chapter in enumerate(selected_chapters, start=1):
-        if stop_event and stop_event.is_set():
-            print('Synthesis stopped by user.')
-            break
-        if max_chapters is not None and i > max_chapters:
-            break
-        text = chapter.extracted_text
-        xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
-        # Fix: include `speed` in the cache-key filename. Previously only
-        # `voice` was encoded, so re-running with a different speed would
-        # silently reuse WAVs generated at the old speed.
-        speed_tag = str(speed).replace('.', 'p')
-        chapter_wav_path = Path(output_folder) / filename.replace(
-            extension, f'_chapter_{i}_{voice}_{speed_tag}_{xhtml_file_name}.wav')
-        chapter_wav_files.append(chapter_wav_path)
-
-        if Path(chapter_wav_path).exists():
-            print(f'File for chapter {i} already exists. Skipping')
-            stats.processed_chars += len(text)
-            if post_event:
-                post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
-            continue
-        if len(text.strip()) < 10:
-            print(f'Skipping empty chapter {i}')
-            chapter_wav_files.remove(chapter_wav_path)
-            # Fix: still count these characters as processed so progress/ETA
-            # tracking doesn't permanently under-count the total.
-            stats.processed_chars += len(text)
-            continue
-        if ai_enabled:
-            if post_event:
-                post_event('CORE_AI_REWRITE', chapter_index=chapter.chapter_index,
-                           chapter_total=len(selected_chapters),
-                           chunk_index=0, chunk_total=0)
-            print(f'AI rewrite: chapter {i} ({len(text):,} chars)')
-            text = correct_phonetics_ai(
-                text, ai_api_key, model=ai_model,
-                stop_event=stop_event, post_event=post_event,
-                chapter_index=chapter.chapter_index,
-                chapter_total=len(selected_chapters),
-            )
+    try:
+        for i, chapter in enumerate(selected_chapters, start=1):
             if stop_event and stop_event.is_set():
-                print('Synthesis stopped by user during AI rewrite.')
+                print('Synthesis stopped by user.')
                 break
-        if i == 1:
-            text = f'{title} – {creator}.\n\n' + text
+            if max_chapters is not None and i > max_chapters:
+                break
+            text = chapter.extracted_text
+            xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
+            # Fix: include `speed` in the cache-key filename. Previously only
+            # `voice` was encoded, so re-running with a different speed would
+            # silently reuse WAVs generated at the old speed.
+            speed_tag = str(speed).replace('.', 'p')
+            # Chatterbox WAVs are cached separately from Kokoro WAVs, so switching
+            # engines never silently reuses the other engine's output.
+            engine_tag = '' if tts_engine == 'kokoro' else f'_{tts_engine}'
+            chapter_wav_path = Path(output_folder) / filename.replace(
+                extension, f'_chapter_{i}_{voice}{engine_tag}_{speed_tag}_{xhtml_file_name}.wav')
+            chapter_wav_files.append(chapter_wav_path)
 
-        start_time = time.time()
-        if post_event:
-            post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
+            if Path(chapter_wav_path).exists():
+                print(f'File for chapter {i} already exists. Skipping')
+                stats.processed_chars += len(text)
+                if post_event:
+                    post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
+                continue
+            if len(text.strip()) < 10:
+                print(f'Skipping empty chapter {i}')
+                chapter_wav_files.remove(chapter_wav_path)
+                # Fix: still count these characters as processed so progress/ETA
+                # tracking doesn't permanently under-count the total.
+                stats.processed_chars += len(text)
+                continue
+            if ai_enabled:
+                if post_event:
+                    post_event('CORE_AI_REWRITE', chapter_index=chapter.chapter_index,
+                               chapter_total=len(selected_chapters),
+                               chunk_index=0, chunk_total=0)
+                print(f'AI rewrite: chapter {i} ({len(text):,} chars)')
+                text = correct_phonetics_ai(
+                    text, ai_api_key, model=ai_model,
+                    stop_event=stop_event, post_event=post_event,
+                    chapter_index=chapter.chapter_index,
+                    chapter_total=len(selected_chapters),
+                    tts_engine=tts_engine,
+                )
+                if stop_event and stop_event.is_set():
+                    print('Synthesis stopped by user during AI rewrite.')
+                    break
+            if i == 1:
+                text = f'{title} – {creator}.\n\n' + text
 
-        audio_segments = gen_audio_segments(
-            pipeline, text, voice, speed, stats,
-            post_event=post_event, max_sentences=max_sentences, stop_event=stop_event)
-
-        if audio_segments:
-            final_audio = np.concatenate(audio_segments)
-            peak = np.abs(final_audio).max()
-            if peak > 0:
-                final_audio = final_audio * (0.708 / peak)
-            # Fix: write to a temp file and rename atomically, so a run that
-            # is killed mid-write never leaves behind a partial WAV that a
-            # later "already exists" resume check would mistake for done.
-            tmp_wav_path = chapter_wav_path.with_suffix('.wav.tmp')
-            soundfile.write(tmp_wav_path, final_audio, sample_rate, format='WAV', subtype='PCM_16')
-            tmp_wav_path.replace(chapter_wav_path)
-            end_time = time.time()
-            delta_seconds = end_time - start_time
-            chars_per_sec = len(text) / delta_seconds
-            print('Chapter written to', chapter_wav_path)
+            start_time = time.time()
             if post_event:
-                post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
-            print(f'Chapter {i} read in {delta_seconds:.2f} seconds ({chars_per_sec:.0f} characters per second)')
-        else:
-            print(f'Warning: No audio generated for chapter {i}')
-            chapter_wav_files.remove(chapter_wav_path)
+                post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
+
+            if tts_engine == 'chatterbox':
+                try:
+                    audio_segments, write_sample_rate = gen_audio_segments_chatterbox(
+                        bridge, text, stats=stats, post_event=post_event,
+                        max_chunks=max_sentences, stop_event=stop_event)
+                except ChatterboxError as e:
+                    print(f'\033[91mChatterbox generation failed: {e}\033[0m')
+                    if post_event:
+                        post_event('CORE_ERROR', message=f'Chatterbox generation failed: {e}')
+                    break
+            else:
+                audio_segments = gen_audio_segments(
+                    pipeline, text, voice, speed, stats,
+                    post_event=post_event, max_sentences=max_sentences, stop_event=stop_event)
+                write_sample_rate = sample_rate
+
+            if audio_segments:
+                final_audio = np.concatenate(audio_segments)
+                peak = np.abs(final_audio).max()
+                if peak > 0:
+                    final_audio = final_audio * (0.708 / peak)
+                # Fix: write to a temp file and rename atomically, so a run that
+                # is killed mid-write never leaves behind a partial WAV that a
+                # later "already exists" resume check would mistake for done.
+                tmp_wav_path = chapter_wav_path.with_suffix('.wav.tmp')
+                soundfile.write(tmp_wav_path, final_audio, write_sample_rate,
+                                format='WAV', subtype='PCM_16')
+                tmp_wav_path.replace(chapter_wav_path)
+                end_time = time.time()
+                delta_seconds = end_time - start_time
+                chars_per_sec = len(text) / delta_seconds
+                print('Chapter written to', chapter_wav_path)
+                if post_event:
+                    post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
+                print(f'Chapter {i} read in {delta_seconds:.2f} seconds ({chars_per_sec:.0f} characters per second)')
+            else:
+                print(f'Warning: No audio generated for chapter {i}')
+                chapter_wav_files.remove(chapter_wav_path)
+    finally:
+        if bridge is not None:
+            bridge.close()
 
     if has_ffmpeg and not (stop_event and stop_event.is_set()):
         # Fix: guard against an empty chapter_wav_files list (e.g. every
@@ -715,6 +789,11 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
         gemini_model=settings.get('gemini_model', 'gemini-3.1-flash-lite'),
         gemini_enabled=settings.get('gemini_enabled', False),
         last_open_dir=settings.get('last_open_dir', ''),
+        tts_engine=tts_engine,
+        chatterbox_ref_audio=settings.get('chatterbox_ref_audio', ''),
+        chatterbox_device=settings.get('chatterbox_device', 'cuda'),
+        chatterbox_voice_source=settings.get('chatterbox_voice_source', 'preset'),
+        voice_samples_dir=settings.get('voice_samples_dir', str(DEFAULT_VOICE_SAMPLES_DIR)),
     )
 
 
@@ -768,13 +847,7 @@ def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=N
             # Apply a short 5 ms fade-in / fade-out to each segment to
             # prevent clicks caused by DC-offset discontinuities at
             # sentence boundaries.
-            fade_samples = min(int(sample_rate * 0.005), len(audio) // 4)
-            if fade_samples > 0:
-                ramp = np.linspace(0.0, 1.0, fade_samples, dtype=audio.dtype)
-                audio = audio.copy()
-                audio[:fade_samples] *= ramp
-                audio[-fade_samples:] *= ramp[::-1]
-            audio_segments.append(audio)
+            audio_segments.append(_apply_fade(np.asarray(audio)))
         if stats:
             stats.processed_chars += len(sent.text)
             tts_share = getattr(stats, 'tts_progress_share', 1.0)
@@ -797,6 +870,497 @@ def gen_text(text, voice=DEFAULT_VOICE, output_file='text.wav', speed=1, play=Fa
     soundfile.write(output_file, final_audio, sample_rate)
     if play:
         subprocess.run(['ffplay', '-autoexit', '-nodisp', output_file])
+
+
+# ---------------------------------------------------------------------------
+# Voice sample library — Kokoro voices rendered as Chatterbox voice presets.
+#
+# Chatterbox ships no named voice list: `generate()` either uses its single
+# built-in speaker or clones one from a reference WAV. To give Chatterbox the
+# same voice dropdown as Kokoro, we render one short clip per Kokoro voice
+# using Kokoro itself and hand that clip to Chatterbox as audio_prompt_path.
+# Preset name == Kokoro voice name, so the two engines share one dropdown and
+# no .wav path ever has to be managed by hand (a custom WAV stays available).
+# ---------------------------------------------------------------------------
+
+# Neutral English narration with wide phoneme coverage and no proper nouns
+# (proper nouns get mispronounced by G2P and would pollute the clone).
+VOICE_SAMPLE_TEXT = (
+    "The north wind and the south wind move gently across the quiet valley, "
+    "where a small brown fox jumps over a lazy dog beside the riverbank. "
+    "She sells seashells by the shimmering seashore, and the old sailors sing "
+    "songs about silver moonlit oceans and patient constellations."
+)
+
+# Bump when VOICE_SAMPLE_TEXT changes: samples recorded under an older script
+# are reported as missing so they get rebuilt instead of silently cloned.
+VOICE_SAMPLE_TEXT_VERSION = 1
+
+VOICE_SAMPLE_INDEX = 'index.json'
+VOICE_SAMPLE_MIN_SECONDS = 5.0
+VOICE_SAMPLE_TRIM_THRESHOLD = 0.005   # ~ -46 dBFS, safely below speech level
+
+CHATTERBOX_VOICE_SOURCES = ('preset', 'custom')
+
+
+def voice_samples_dir(settings=None):
+    """Directory holding the rendered samples; overridable via settings."""
+    settings = settings if settings is not None else load_settings()
+    raw = str(settings.get('voice_samples_dir') or '').strip()
+    return Path(raw).expanduser() if raw else DEFAULT_VOICE_SAMPLES_DIR
+
+
+def voice_sample_path(voice, settings=None):
+    """Where the sample for `voice` lives, whether or not it has been built."""
+    return voice_samples_dir(settings) / f'{voice}.wav'
+
+
+def _read_sample_index(settings=None):
+    try:
+        with open(voice_samples_dir(settings) / VOICE_SAMPLE_INDEX) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_sample_index(index, settings=None):
+    path = voice_samples_dir(settings) / VOICE_SAMPLE_INDEX
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.json.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(index, f, indent=2)
+    tmp.replace(path)
+
+
+def voice_sample_info(voice, settings=None):
+    """Index entry for `voice` (duration, creation date), or {} if unknown."""
+    return _read_sample_index(settings).get('voices', {}).get(voice, {})
+
+
+def voice_sample_exists(voice, settings=None):
+    """True only when the clip is on disk and was built from the current text."""
+    if not voice:
+        return False
+    if not voice_sample_path(voice, settings).is_file():
+        return False
+    return int(voice_sample_info(voice, settings).get('text_version', 0)) == VOICE_SAMPLE_TEXT_VERSION
+
+
+def missing_voice_samples(voices_to_check, settings=None):
+    """Subset of `voices_to_check` that still needs a sample rendered."""
+    return [v for v in dict.fromkeys(voices_to_check) if v and not voice_sample_exists(v, settings)]
+
+
+def _trim_edge_silence(audio, threshold=VOICE_SAMPLE_TRIM_THRESHOLD):
+    """Drop near-silent head/tail so Chatterbox conditions on speech, not gaps."""
+    if audio.size == 0:
+        return audio
+    loud = np.flatnonzero(np.abs(audio) > threshold)
+    if loud.size == 0:
+        return audio
+    start, end = int(loud[0]), int(loud[-1]) + 1
+    if (end - start) < sample_rate * VOICE_SAMPLE_MIN_SECONDS:
+        return audio
+    return audio[start:end]
+
+
+def generate_voice_sample(voice, speed=1.0, overwrite=False, stop_event=None,
+                          settings=None, pipeline=None):
+    """Render `voice` with Kokoro and store it as that voice's Chatterbox preset.
+
+    Returns the sample path, or None when the run was cancelled, produced no
+    audio, or the sample was already current and `overwrite` is False.
+    An injected `pipeline` must have been built for `lang_code_from_voice(voice)`
+    (generate_voice_samples() guarantees that).
+    """
+    if voice_sample_exists(voice, settings) and not overwrite:
+        return voice_sample_path(voice, settings)
+
+    set_espeak_library()
+    if pipeline is None:
+        pipeline = KPipeline(lang_code=lang_code_from_voice(voice))
+    segments = gen_audio_segments(pipeline, VOICE_SAMPLE_TEXT, voice=voice,
+                                  speed=speed, stop_event=stop_event)
+    if stop_event and stop_event.is_set():
+        return None
+    if not segments:
+        return None
+
+    audio = _trim_edge_silence(np.concatenate(segments).astype(np.float32))
+    peak = np.abs(audio).max()
+    if peak > 0:
+        audio = audio * (0.708 / peak)   # same target peak as chapter audio
+
+    path = voice_sample_path(voice, settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.wav.tmp')
+    soundfile.write(tmp, audio, sample_rate, format='WAV', subtype='PCM_16')
+    tmp.replace(path)
+
+    index = _read_sample_index(settings)
+    index['text_version'] = VOICE_SAMPLE_TEXT_VERSION
+    index.setdefault('voices', {})[voice] = {
+        'file': path.name,
+        'sample_rate': sample_rate,
+        'duration_sec': round(len(audio) / sample_rate, 2),
+        'created': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'text_version': VOICE_SAMPLE_TEXT_VERSION,
+    }
+    _write_sample_index(index, settings)
+    print(f'Voice sample for {voice} written to {path} '
+          f'({len(audio) / sample_rate:.1f}s)')
+    return path
+
+
+def generate_voice_samples(voices_to_build, speed=1.0, overwrite=False,
+                           stop_event=None, progress=None, settings=None):
+    """Build samples for many voices, reusing one Kokoro pipeline per language.
+
+    `progress(voice, path_or_None, done, total)` is called after each voice.
+    Returns the list of paths written.
+    """
+    pending = list(dict.fromkeys(v for v in voices_to_build if v))
+    if not overwrite:
+        pending = missing_voice_samples(pending, settings)
+
+    pipelines = {}
+    written = []
+    total = len(pending)
+    for done, voice in enumerate(pending, start=1):
+        if stop_event and stop_event.is_set():
+            print('Voice sample build stopped by user.')
+            break
+        lang_code = lang_code_from_voice(voice)
+        if lang_code not in pipelines:
+            set_espeak_library()
+            pipelines[lang_code] = KPipeline(lang_code=lang_code)
+        path = generate_voice_sample(voice, speed=speed, overwrite=True,
+                                     stop_event=stop_event, settings=settings,
+                                     pipeline=pipelines[lang_code])
+        if path:
+            written.append(path)
+        if progress:
+            progress(voice, path, done, total)
+    return written
+
+
+def resolve_chatterbox_ref_audio(voice, source='preset', custom_path='', settings=None):
+    """The one place that decides which WAV Chatterbox should clone.
+
+    'preset' → the Kokoro-rendered sample for `voice`, empty when not built yet.
+    'custom' → the user's own clip, empty when it has gone missing.
+    """
+    if source == 'custom':
+        return custom_path if custom_path and Path(custom_path).is_file() else ''
+    if not voice_sample_exists(voice, settings):
+        return ''
+    return str(voice_sample_path(voice, settings))
+
+
+# ---------------------------------------------------------------------------
+# Chatterbox chapter synthesis
+#
+# Chatterbox Multilingual V3 degrades on long inputs: the community and the
+# library's own examples converge on a hard ceiling of ~300 characters per
+# generation (the Turbo variant hallucinates past ~350; most wrappers default
+# to 280-300). Full chapters are therefore split into <= CHATTERBOX_MAX_CHUNK_CHARS
+# pieces at sentence boundaries (then clause, then word boundaries) and the
+# resulting audio is stitched back together.
+#
+# The bridge is kept alive for the whole run so the (multi-second) model load
+# is paid once rather than once per chunk or per chapter.
+# ---------------------------------------------------------------------------
+
+CHATTERBOX_BRIDGE_DIR = Path(
+    os.environ.get('AUDIBLEZ_CHATTERBOX_BRIDGE_DIR', '/home/vlad/chatterbox_venv'))
+CHATTERBOX_BRIDGE_PYTHON = CHATTERBOX_BRIDGE_DIR / 'bin' / 'python3'
+CHATTERBOX_BRIDGE_SCRIPT = CHATTERBOX_BRIDGE_DIR / 'generate.py'
+CHATTERBOX_T3_MODEL = 't3_mtl23ls_v3.safetensors'
+CHATTERBOX_LANGUAGE_ID = 'en'
+
+# ~300 chars is the widely-used ceiling for reliable Chatterbox output.
+CHATTERBOX_MAX_CHUNK_CHARS = 300
+
+_SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?\u2026])\s+')
+_CLAUSE_BOUNDARY_RE = re.compile(r'(?<=[,;:])\s+')
+
+
+def _split_oversized_sentence(sentence, max_chars):
+    """Break a single sentence longer than `max_chars` at clause boundaries,
+    falling back to word boundaries and finally a hard character split."""
+    out = []
+    current = ''
+    for clause in _CLAUSE_BOUNDARY_RE.split(sentence):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if len(clause) > max_chars:
+            for word in clause.split():
+                candidate = f'{current} {word}'.strip() if current else word
+                if len(candidate) <= max_chars:
+                    current = candidate
+                else:
+                    if current:
+                        out.append(current)
+                    current = word
+        else:
+            candidate = f'{current} {clause}'.strip() if current else clause
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    out.append(current)
+                current = clause
+    if current:
+        out.append(current)
+
+    final = []
+    for piece in out:
+        if len(piece) <= max_chars:
+            final.append(piece)
+        else:
+            final.extend(piece[i:i + max_chars] for i in range(0, len(piece), max_chars))
+    return final or [sentence[:max_chars]]
+
+
+def split_chatterbox_text(text, max_chars=CHATTERBOX_MAX_CHUNK_CHARS):
+    """Split `text` into chunks no longer than `max_chars` for Chatterbox.
+
+    Break priority: paragraph -> sentence -> clause -> word -> hard split.
+    Original punctuation is preserved so prosody stays as written. Returns a
+    list of non-empty chunks (empty list for empty input).
+    """
+    text = (text or '').strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    for paragraph in re.split(r'\n{2,}', text):
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        current = ''
+        for sentence in _SENTENCE_BOUNDARY_RE.split(paragraph):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            pieces = ([sentence] if len(sentence) <= max_chars
+                      else _split_oversized_sentence(sentence, max_chars))
+            for piece in pieces:
+                candidate = f'{current} {piece}'.strip() if current else piece
+                if len(candidate) <= max_chars:
+                    current = candidate
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = piece
+        if current:
+            chunks.append(current)
+    return chunks
+
+
+_CHATTERBOX_NOISE_MARKERS = ('it/s', '?it/s', 'Sampling:', 'Fetching', '%|')
+
+
+def _is_chatterbox_progress_noise(line):
+    """True for tqdm/pipeline progress chatter that should not be echoed."""
+    return any(marker in line for marker in _CHATTERBOX_NOISE_MARKERS)
+
+
+class ChatterboxError(RuntimeError):
+    """Raised when the Chatterbox bridge fails or dies."""
+
+
+class ChatterboxCancelled(ChatterboxError):
+    """Raised when generation was interrupted by a stop_event."""
+
+
+class ChatterboxBridge:
+    """Persistent subprocess wrapper around the Chatterbox venv bridge.
+
+    Starts `generate.py --serve` once, then talks newline-delimited JSON to
+    it, so the TTS model stays loaded for the whole book.
+    """
+
+    def __init__(self, device='cuda', ref_audio='', language_id=CHATTERBOX_LANGUAGE_ID,
+                 t3_model=CHATTERBOX_T3_MODEL, python=None, script=None):
+        self.device = device
+        self.ref_audio = ref_audio
+        self.language_id = language_id
+        self.t3_model = t3_model
+        self.python = Path(python) if python else CHATTERBOX_BRIDGE_PYTHON
+        self.script = Path(script) if script else CHATTERBOX_BRIDGE_SCRIPT
+        if not self.python.is_file():
+            raise ChatterboxError(f'Chatterbox python interpreter not found: {self.python}')
+        if not self.script.is_file():
+            raise ChatterboxError(f'Chatterbox bridge script not found: {self.script}')
+
+        self._responses = Queue()
+        self.proc = subprocess.Popen(
+            [str(self.python), str(self.script), '--serve'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8', bufsize=1)
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        threading.Thread(target=self._read_responses, daemon=True).start()
+
+    def _drain_stderr(self):
+        # Chatterbox/tqdm write many progress-bar updates (with \r) to stderr.
+        # Drain them so the pipe never fills, but don't echo the noise for a
+        # whole book; keep real diagnostics (warnings, tracebacks, errors).
+        try:
+            for line in self.proc.stderr:
+                line = line.rstrip('\n')
+                if not line or _is_chatterbox_progress_noise(line):
+                    continue
+                print(f'[chatterbox] {line}')
+        except Exception:
+            pass
+
+    def _read_responses(self):
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    # Third-party stdout noise that slipped through; ignore it.
+                    continue
+                self._responses.put(obj)
+        finally:
+            self._responses.put(None)
+
+    def generate(self, text, output_path, stop_event=None):
+        """Synthesize `text` to `output_path`; return the bridge's result dict."""
+        payload = json.dumps({
+            'text': text,
+            'output_path': str(output_path),
+            'device': self.device,
+            'language_id': self.language_id,
+            'audio_prompt_path': self.ref_audio,
+            't3_model': self.t3_model,
+        })
+        try:
+            self.proc.stdin.write(payload + '\n')
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            raise ChatterboxError(f'Chatterbox bridge is not running: {e}')
+
+        while True:
+            if stop_event and stop_event.is_set():
+                raise ChatterboxCancelled('Stopped by user.')
+            try:
+                obj = self._responses.get(timeout=0.25)
+            except Empty:
+                if self.proc.poll() is not None and self._responses.empty():
+                    raise ChatterboxError('Chatterbox bridge exited unexpectedly.')
+                continue
+            if obj is None:
+                raise ChatterboxError('Chatterbox bridge closed unexpectedly.')
+            if obj.get('success'):
+                return obj
+            raise ChatterboxError(obj.get('error') or 'Unknown Chatterbox error.')
+
+    def close(self):
+        proc = getattr(self, 'proc', None)
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None and proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _apply_fade(audio, fade_ms=5.0):
+    """Apply a short fade-in/out so segment boundaries never click."""
+    fade_samples = min(int(sample_rate * fade_ms / 1000.0), len(audio) // 4)
+    if fade_samples <= 0:
+        return audio
+    ramp = np.linspace(0.0, 1.0, fade_samples, dtype=audio.dtype)
+    audio = audio.copy()
+    audio[:fade_samples] *= ramp
+    audio[-fade_samples:] *= ramp[::-1]
+    return audio
+
+
+def gen_audio_segments_chatterbox(bridge, text, stats=None, max_chunks=None,
+                                  post_event=None, stop_event=None):
+    """Synthesize `text` with Chatterbox in <=300-char chunks.
+
+    Returns (audio_segments, sample_rate). Each chunk is generated by the
+    persistent bridge to a temp WAV, read back as a mono float array, faded,
+    and returned for the caller to concatenate and normalize.
+    """
+    chunks = split_chatterbox_text(text)
+    if max_chunks is not None:
+        chunks = chunks[:max_chunks]
+    if not chunks:
+        return [], sample_rate
+
+    segments = []
+    write_sr = sample_rate
+    processed = 0
+    started = time.time()
+    # Splitting consumes the whitespace at each chunk/paragraph boundary, so the
+    # chunks sum to slightly fewer chars than the source. Add that back on the
+    # final chunk so per-chapter progress can actually reach 100%.
+    separator_chars = max(0, len(text) - sum(len(c) for c in chunks))
+    tmp_dir = tempfile.mkdtemp(prefix='audiblez_chatterbox_')
+    try:
+        for idx, chunk in enumerate(chunks, start=1):
+            if stop_event and stop_event.is_set():
+                print('Synthesis stopped by user.')
+                break
+            chunk_path = Path(tmp_dir) / f'chunk_{idx:05d}.wav'
+            try:
+                result = bridge.generate(chunk, chunk_path, stop_event=stop_event)
+            except ChatterboxCancelled:
+                print('Synthesis stopped by user.')
+                break
+            write_sr = int(result.get('sample_rate') or write_sr)
+            if not chunk_path.is_file():
+                raise ChatterboxError('Chatterbox did not write a chunk WAV.')
+            audio, _sr = soundfile.read(chunk_path, dtype='float32')
+            try:
+                chunk_path.unlink()
+            except OSError:
+                pass
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            audio = _apply_fade(np.asarray(audio, dtype=np.float32))
+            segments.append(audio)
+
+            counted = len(chunk) + (separator_chars if idx == len(chunks) else 0)
+            processed += counted
+            if stats:
+                stats.processed_chars += counted
+                elapsed = max(time.time() - started, 1e-6)
+                stats.chars_per_sec = max(1.0, processed / elapsed)
+                tts_share = getattr(stats, 'tts_progress_share', 1.0)
+                stats.progress = int(stats.processed_chars / stats.total_chars * tts_share * 100)
+                remaining_tts = (stats.total_chars - stats.processed_chars) / stats.chars_per_sec
+                remaining_encode = getattr(stats, 'estimated_encode_secs', 0)
+                stats.eta = strfdelta(remaining_tts + remaining_encode)
+                if post_event:
+                    post_event('CORE_PROGRESS', stats=stats)
+                print(f'Chatterbox chunk {idx}/{len(chunks)} — '
+                      f'{stats.progress}% (ETA {stats.eta})')
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return segments, write_sr
 
 
 def _sanitize_api_key(api_key):
@@ -854,7 +1418,43 @@ _PHONETIC_RULES = (
     "  respelling is preferred when it's simpler and equally accurate."
 )
 
-def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite', stop_event=None):
+# Chatterbox has no inline phonetic-override syntax: IPA symbols, stress marks
+# and [[...]] would be read literally (or dropped). Chatterbox rewrites must
+# therefore use ordinary English letter respelling only.
+_CHATTERBOX_PHONETIC_RULES = (
+    "Only flag/change words or formatting that affect pronunciation, such as:\n"
+    "- Expand abbreviations (Dr. -> Doctor, St. -> Saint only when it is a name, "
+    "  NASA -> N A S A, FBI -> F B I, etc.)\n"
+    "- Spell out numbers and dates in words (2024 -> twenty twenty four, 3rd -> third)\n"
+    "- Respell words with unusual pronunciation using ordinary English letters\n\n"
+    "FOREIGN PROPER NOUNS (mandatory, not optional):\n"
+    "Any proper noun using non-English orthography or spelling conventions — accented "
+    "letters (é, è, ç, œ, ü, etc.), unusual consonant clusters, silent letters, or "
+    "foreign name endings — MUST be rewritten using ordinary English letters. This applies "
+    "to place names, personal names, military unit names, and any other proper noun. Do not "
+    "leave a French, German, or other foreign-language name unchanged, even if you are "
+    "uncertain of the exact native pronunciation — an approximate English rendering is "
+    "always better than leaving the raw spelling for the default G2P to butcher.\n"
+    "  Example: 'Amiens' -> 'Amyen'\n"
+    "  Example: 'Péronne' -> 'Peyron'\n"
+    "  Example: 'Flixécourt' -> 'Flixaycoor'\n"
+    "  Example: 'GUDERIAN' -> 'Guderian' (normalize casing)\n\n"
+    "IMPORTANT: The Chatterbox TTS engine does NOT understand phonetic alphabets. "
+    "Do NOT output IPA symbols, stress marks, slashes, square brackets, or espeak "
+    "[[...]] syntax. Use only ordinary English letters and normal punctuation.\n\n"
+    "Prosody: existing punctuation already controls intonation — "
+    "; : , . ! ? — … \" ( ) \u201c \u201d all shape phrasing and pitch. "
+    "Do not remove or alter punctuation; it is meaningful for Chatterbox."
+)
+
+
+def _phonetic_rules_for(tts_engine):
+    """Pick the rewrite ruleset for the engine that will actually speak the text."""
+    return _CHATTERBOX_PHONETIC_RULES if tts_engine == 'chatterbox' else _PHONETIC_RULES
+
+
+def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite',
+                                    stop_event=None, tts_engine='kokoro'):
     """
     Use Google Gemini AI to analyze text for potential TTS pronunciation issues
     and provide phonetic transcription guidance.
@@ -878,23 +1478,25 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
     if not api_key.startswith('AIza'):
         return "Error: API key looks invalid (Gemini keys typically start with 'AIza'). Please check the value you pasted."
 
+    rules = _phonetic_rules_for(tts_engine)
+    engine_name = 'Chatterbox' if tts_engine == 'chatterbox' else 'Kokoro'
+
     def _do_call():
         client = genai.Client(api_key=api_key)
         return client.models.generate_content(
             model=model,
             contents=(
-                "You are a phonetic transcription expert for a Kokoro text-to-speech system. "
+                f"You are a phonetic transcription expert for a {engine_name} text-to-speech system. "
                 "Analyze the following text from an audiobook and identify words or phrases "
                 "that might be mispronounced by the TTS engine, using EXACTLY the same rules "
                 "that will be used to actually rewrite this text (listed below), so your analysis "
                 "matches what the rewrite step will do.\n\n"
-                f"{_PHONETIC_RULES}\n\n"
+                f"{rules}\n\n"
                 "For each issue found, provide:\n"
                 "1. The problematic word/phrase\n"
                 "2. Why it might be mispronounced\n"
-                "3. The correct phonetic transcription (IPA)\n"
-                "4. The suggested rewrite, respelling, or [[espeak_phoneme]]/IPA override that "
-                "   will actually be applied\n\n"
+                "3. The suggested rewrite that will actually be applied\n"
+                "4. A short explanation of the change\n\n"
                 "Remember: foreign proper nouns are a MANDATORY category — do not skip any of "
                 "them in your analysis, even if you're only approximating the pronunciation.\n\n"
                 "If the text looks clean with no obvious issues, say so and provide a brief confirmation.\n\n"
@@ -916,7 +1518,8 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
     # Produce the actual TTS-bound text using the exact same rewrite path
     # (including chunking for long text) that main() uses before synthesis,
     # so the preview matches reality rather than just describing changes.
-    rewritten_text = correct_phonetics_ai(text, api_key, model=model, stop_event=stop_event)
+    rewritten_text = correct_phonetics_ai(text, api_key, model=model,
+                                          stop_event=stop_event, tts_engine=tts_engine)
 
     return (
         f"{analysis}\n\n"
@@ -968,7 +1571,7 @@ def _ai_split_paragraphs(text, max_chars):
 
 def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
                          stop_event=None, post_event=None,
-                         chapter_index=None, chapter_total=None):
+                         chapter_index=None, chapter_total=None, tts_engine='kokoro'):
     """
     Use Google Gemini AI to silently rewrite text for TTS-friendly pronunciation.
 
@@ -976,6 +1579,9 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
     (≈ 1.2M chars) and each chunk is rewritten in its own request. The
     chunks are joined with blank lines to mirror the paragraph structure
     of the input.
+
+    `tts_engine` selects which phonetic ruleset to apply: Kokoro accepts inline
+    IPA overrides, while Chatterbox must be fed plain-English respellings only.
 
     Returns the corrected text string suitable for direct use as TTS input.
     If AI cannot be reached or returns invalid output, the original text is
@@ -990,7 +1596,8 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
 
     chunks = _ai_split_paragraphs(text, _AI_REWRITE_MAX_CHARS)
     if len(chunks) == 1:
-        return _ai_rewrite_single_chunk(chunks[0], api_key, model, stop_event=stop_event, post_event=post_event)
+        return _ai_rewrite_single_chunk(chunks[0], api_key, model, stop_event=stop_event,
+                                        post_event=post_event, tts_engine=tts_engine)
 
     rewritten = []
     for idx, chunk in enumerate(chunks, start=1):
@@ -1000,28 +1607,33 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
             post_event('CORE_AI_REWRITE', chapter_index=chapter_index,
                        chapter_total=chapter_total,
                        chunk_index=idx, chunk_total=len(chunks))
-        out = _ai_rewrite_single_chunk(chunk, api_key, model, stop_event=stop_event, post_event=post_event)
+        out = _ai_rewrite_single_chunk(chunk, api_key, model, stop_event=stop_event,
+                                       post_event=post_event, tts_engine=tts_engine)
         if out == chunk:
             rewritten.append(chunk)
         else:
             rewritten.append(out)
     return '\n\n'.join(rewritten)
 
-def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=None):
+def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=None,
+                             tts_engine='kokoro'):
     """Single-chunk Gemini call used by correct_phonetics_ai. Falls back to
     the original text on any failure or invalid output (after retries).
 
     Uses a two-section output format (NAMES_FOUND then REWRITTEN_TEXT) to
     force the model to explicitly enumerate foreign/unusual proper nouns
-    before it writes the rewrite. Shares _PHONETIC_RULES with
+    before it writes the rewrite. Shares the engine-specific ruleset with
     check_phonetic_transcription_ai so both prompts apply identical rules.
     """
+    engine_name = 'Chatterbox' if tts_engine == 'chatterbox' else 'Kokoro'
+    rules = _phonetic_rules_for(tts_engine)
+
     def _do_call():
         client = genai.Client(api_key=api_key)
         return client.models.generate_content(
             model=model,
             contents=(
-                "You are a phonetic preprocessing step for the Kokoro TTS engine. "
+                f"You are a phonetic preprocessing step for the {engine_name} TTS engine. "
                 "You will do this in two steps, and your response MUST contain both "
                 "sections below, in order, with the exact headers shown.\n\n"
                 "STEP 1 — Find every proper noun in the text that does not use standard "
@@ -1033,7 +1645,7 @@ def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=N
                 "STEP 2 — Rewrite the full text so the TTS engine reads it correctly. Keep "
                 "the meaning, punctuation, and sentence structure exactly the same. Apply "
                 "these rules:\n\n"
-                f"{_PHONETIC_RULES}\n\n"
+                f"{rules}\n\n"
                 "Every proper noun you listed in Step 1 MUST be changed in some way in the "
                 "Step 2 rewrite.\n\n"
                 "FORMAT YOUR RESPONSE EXACTLY LIKE THIS (including the headers, nothing before or after):\n"

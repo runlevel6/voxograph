@@ -10,6 +10,7 @@ import platform
 import subprocess
 import io
 import os
+import json
 import wx
 from wx.lib.newevent import NewEvent
 from wx.lib.scrolledpanel import ScrolledPanel
@@ -18,7 +19,12 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 # fix #9: import settings helpers from core — single source of truth
-from audiblez.core import load_settings, save_settings, DEFAULT_VOICE, check_phonetic_transcription_ai, correct_phonetics_ai
+from audiblez.core import (
+    load_settings, save_settings, DEFAULT_VOICE, check_phonetic_transcription_ai,
+    correct_phonetics_ai, voice_sample_exists, voice_sample_info,
+    generate_voice_sample, generate_voice_samples, missing_voice_samples,
+    resolve_chatterbox_ref_audio,
+)
 from audiblez.voices import voices, flags
 
 EVENTS = {
@@ -28,10 +34,33 @@ EVENTS = {
     'CORE_CHAPTER_FINISHED': NewEvent(),
     'CORE_AI_REWRITE': NewEvent(),
     'CORE_AI_RETRY_EXHAUSTED': NewEvent(),
+    'CORE_ERROR': NewEvent(),
     'CORE_FINISHED': NewEvent()
 }
 
 border = 5
+
+
+def _extract_bridge_json(stdout):
+    """Return the JSON object emitted by the Chatterbox bridge.
+
+    The bridge's stdout can carry stray prints from third-party libraries
+    (e.g. perth's "loaded PerthNet" line), so scan the lines and return the
+    last one that parses as a JSON object rather than assuming clean output.
+    """
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    raise RuntimeError(
+        f"Chatterbox bridge produced no JSON result. stdout={stdout!r}"
+    )
 
 
 class MainWindow(wx.Frame):
@@ -52,6 +81,7 @@ class MainWindow(wx.Frame):
         self.Bind(EVENTS['CORE_PROGRESS'][1], self.on_core_progress)
         self.Bind(EVENTS['CORE_AI_REWRITE'][1], self.on_core_ai_rewrite)
         self.Bind(EVENTS['CORE_AI_RETRY_EXHAUSTED'][1], self.on_core_ai_retry_exhausted)
+        self.Bind(EVENTS['CORE_ERROR'][1], self.on_core_error)
         self.Bind(EVENTS['CORE_FINISHED'][1], self.on_core_finished)
 
         self.settings = load_settings()
@@ -127,6 +157,16 @@ class MainWindow(wx.Frame):
         if answer == wx.CANCEL and self.synthesis_in_progress:
             self.cancel_current_synthesis()
 
+    def on_core_error(self, event):
+        msg = getattr(event, 'message', 'Unknown error.')
+        # A fatal core error can return before CORE_FINISHED, so restore the
+        # controls here to avoid leaving the UI stuck in "synthesis running".
+        self.synthesis_in_progress = False
+        self.cancel_button.Hide()
+        self.start_button.Enable()
+        self.synth_panel.Layout()
+        wx.MessageBox(msg, "Synthesis Error", wx.OK | wx.ICON_ERROR)
+
     def on_core_finished(self, event):
         self.synthesis_in_progress = False
         self.cancel_button.Hide()
@@ -178,7 +218,7 @@ class MainWindow(wx.Frame):
 
         self.chapter_label = wx.StaticText(
             self.center_panel, label=f'Edit / Preview content for section "{self.selected_chapter.short_name}":')
-        preview_button = wx.Button(self.center_panel, label="🔊 Preview")
+        preview_button = self.preview_button = wx.Button(self.center_panel, label="🔊 Preview")
         preview_button.Bind(wx.EVT_BUTTON, self.on_preview_chapter)
 
         check_ai_button = wx.Button(self.center_panel, label="🤖 Check with AI")
@@ -207,7 +247,11 @@ class MainWindow(wx.Frame):
         wx.MessageBox(msg, "Audiblez")
 
     def create_right_panel(self, splitter_right):
-        self.right_panel = wx.Panel(splitter_right)
+        # Scrolled: the parameters + synthesis panels can be taller than the
+        # window (especially with the Chatterbox rows), and the start button
+        # must always be reachable.
+        self.right_panel = ScrolledPanel(splitter_right, style=wx.TAB_TRAVERSAL)
+        self.right_panel.SetScrollRate(10, 10)
         self.right_sizer = wx.BoxSizer(wx.VERTICAL)
         self.right_panel.SetSizer(self.right_sizer)
 
@@ -231,6 +275,7 @@ class MainWindow(wx.Frame):
         self.create_book_details_panel()
         self.create_params_panel()
         self.create_synthesis_panel()
+        self.right_panel.SetupScrolling(scroll_x=False, scroll_y=True)
 
     def create_book_details_panel(self):
         book_details_panel = wx.Panel(self.book_info_panel)
@@ -265,22 +310,46 @@ class MainWindow(wx.Frame):
         sizer = wx.GridBagSizer(10, 10)
         panel.SetSizer(sizer)
 
-        engine_label = wx.StaticText(panel, label="Engine:")
-        engine_radio_panel = wx.Panel(panel)
-        cpu_radio = wx.RadioButton(engine_radio_panel, label="CPU", style=wx.RB_GROUP)
-        cuda_radio = wx.RadioButton(engine_radio_panel, label="CUDA")
+        tts_engine_label = wx.StaticText(panel, label="TTS Engine:")
+        tts_engine_radio_panel = wx.Panel(panel)
+        kokoro_radio = wx.RadioButton(tts_engine_radio_panel, label="Kokoro", style=wx.RB_GROUP)
+        chatterbox_radio = wx.RadioButton(tts_engine_radio_panel, label="Chatterbox")
+        initial_engine = self.settings.get('tts_engine', 'kokoro')
+        if initial_engine == 'chatterbox':
+            chatterbox_radio.SetValue(True)
+        else:
+            kokoro_radio.SetValue(True)
+        sizer.Add(tts_engine_label, pos=(0, 0), flag=wx.ALL, border=border)
+        sizer.Add(tts_engine_radio_panel, pos=(0, 1), flag=wx.ALL, border=border)
+        tts_engine_radio_panel_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        tts_engine_radio_panel.SetSizer(tts_engine_radio_panel_sizer)
+        tts_engine_radio_panel_sizer.Add(kokoro_radio, 0, wx.ALL, 5)
+        tts_engine_radio_panel_sizer.Add(chatterbox_radio, 0, wx.ALL, 5)
+        kokoro_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: self._on_tts_engine_changed('kokoro'))
+        chatterbox_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: self._on_tts_engine_changed('chatterbox'))
+        self.kokoro_radio = kokoro_radio
+        self.chatterbox_radio = chatterbox_radio
+
+        compute_label = wx.StaticText(panel, label="Compute Device:")
+        compute_radio_panel = wx.Panel(panel)
+        cpu_radio = wx.RadioButton(compute_radio_panel, label="CPU", style=wx.RB_GROUP)
+        cuda_radio = wx.RadioButton(compute_radio_panel, label="CUDA")
         if torch.cuda.is_available():
             cuda_radio.SetValue(True)
         else:
             cpu_radio.SetValue(True)
-        sizer.Add(engine_label, pos=(0, 0), flag=wx.ALL, border=border)
-        sizer.Add(engine_radio_panel, pos=(0, 1), flag=wx.ALL, border=border)
-        engine_radio_panel_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        engine_radio_panel.SetSizer(engine_radio_panel_sizer)
-        engine_radio_panel_sizer.Add(cpu_radio, 0, wx.ALL, 5)
-        engine_radio_panel_sizer.Add(cuda_radio, 0, wx.ALL, 5)
+        sizer.Add(compute_label, pos=(1, 0), flag=wx.ALL, border=border)
+        sizer.Add(compute_radio_panel, pos=(1, 1), flag=wx.ALL, border=border)
+        compute_radio_panel_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        compute_radio_panel.SetSizer(compute_radio_panel_sizer)
+        compute_radio_panel_sizer.Add(cpu_radio, 0, wx.ALL, 5)
+        compute_radio_panel_sizer.Add(cuda_radio, 0, wx.ALL, 5)
         cpu_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: torch.set_default_device('cpu'))
         cuda_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: torch.set_default_device('cuda'))
+        self.cpu_radio = cpu_radio
+        self.cuda_radio = cuda_radio
+        self.compute_label = compute_label
+        self.compute_radio_panel = compute_radio_panel
 
         flag_and_voice_list = []
         for code, l in voices.items():
@@ -296,38 +365,97 @@ class MainWindow(wx.Frame):
         self.selected_voice = initial_voice_display
         voice_dropdown = wx.ComboBox(panel, choices=flag_and_voice_list, value=initial_voice_display)
         voice_dropdown.Bind(wx.EVT_COMBOBOX, self.on_select_voice)
-        sizer.Add(voice_label, pos=(1, 0), flag=wx.ALL, border=border)
-        sizer.Add(voice_dropdown, pos=(1, 1), flag=wx.ALL, border=border)
+        sizer.Add(voice_label, pos=(2, 0), flag=wx.ALL, border=border)
+        sizer.Add(voice_dropdown, pos=(2, 1), flag=wx.ALL, border=border)
+        self.voice_label = voice_label
+        self.voice_dropdown = voice_dropdown
+
+        voice_source_label = wx.StaticText(panel, label="Voice Source:")
+        voice_source_radio_panel = wx.Panel(panel)
+        preset_radio = wx.RadioButton(voice_source_radio_panel, label="🎤 Voice Preset", style=wx.RB_GROUP)
+        custom_radio = wx.RadioButton(voice_source_radio_panel, label="📁 Custom WAV")
+        if self.settings.get('chatterbox_voice_source', 'preset') == 'custom':
+            custom_radio.SetValue(True)
+        else:
+            preset_radio.SetValue(True)
+        preset_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: self.on_voice_source_changed('preset'))
+        custom_radio.Bind(wx.EVT_RADIOBUTTON, lambda event: self.on_voice_source_changed('custom'))
+        voice_source_radio_panel.SetToolTip(
+            "Voice Preset: Chatterbox clones the selected Kokoro voice from a sample clip. "
+            "Chatterbox Multilingual V3 is English-locked, so US/UK voices make the best presets.\n"
+            "Custom WAV: clone any recording you supply.")
+        sizer.Add(voice_source_label, pos=(3, 0), flag=wx.ALL, border=border)
+        sizer.Add(voice_source_radio_panel, pos=(3, 1), flag=wx.ALL, border=border)
+        voice_source_radio_panel_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        voice_source_radio_panel.SetSizer(voice_source_radio_panel_sizer)
+        voice_source_radio_panel_sizer.Add(preset_radio, 0, wx.ALL, 5)
+        voice_source_radio_panel_sizer.Add(custom_radio, 0, wx.ALL, 5)
+        self.voice_source_label = voice_source_label
+        self.voice_source_radio_panel = voice_source_radio_panel
+        self.preset_radio = preset_radio
+        self.custom_radio = custom_radio
+
+        stored_ref_audio = self.settings.get('chatterbox_ref_audio', '')
+        self.selected_ref_audio = stored_ref_audio
+        ref_audio_label = wx.StaticText(panel, label="Reference Audio:")
+        ref_audio_text_input = wx.TextCtrl(panel, value=stored_ref_audio, style=wx.TE_READONLY)
+        ref_audio_text_input.Bind(wx.EVT_TEXT, self.on_select_ref_audio)
+        ref_audio_button = wx.Button(panel, label="📂 Select")
+        ref_audio_button.Bind(wx.EVT_BUTTON, self.open_ref_audio_dialog)
+        clear_ref_audio_button = wx.Button(panel, label="✕ Clear")
+        clear_ref_audio_button.Bind(wx.EVT_BUTTON, self.clear_ref_audio)
+        build_sample_button = wx.Button(panel, label="🎙 Build Sample")
+        build_sample_button.Bind(wx.EVT_BUTTON, self.on_build_voice_sample)
+        self.build_sample_button = build_sample_button
+        build_all_button = wx.Button(panel, label="Build All")
+        build_all_button.Bind(wx.EVT_BUTTON, self.on_build_all_samples)
+        self.build_all_button = build_all_button
+        ref_button_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        ref_button_sizer.Add(ref_audio_button, 0, wx.RIGHT | wx.ALL, 5)
+        ref_button_sizer.Add(clear_ref_audio_button, 0, wx.RIGHT | wx.ALL, 5)
+        ref_button_sizer.Add(build_sample_button, 0, wx.RIGHT | wx.ALL, 5)
+        ref_button_sizer.Add(build_all_button, 0, wx.ALL, 5)
+        ref_hint = wx.StaticText(panel, label="")
+        sizer.Add(ref_audio_label, pos=(4, 0), flag=wx.ALL, border=border)
+        sizer.Add(ref_audio_text_input, pos=(4, 1), flag=wx.ALL | wx.EXPAND, border=border)
+        sizer.Add(ref_button_sizer, pos=(5, 1), flag=wx.ALL, border=border)
+        sizer.Add(ref_hint, pos=(5, 2), flag=wx.ALL, border=border)
+        self.ref_audio_label = ref_audio_label
+        self.ref_audio_text_input = ref_audio_text_input
+        self.ref_audio_button = ref_audio_button
+        self.clear_ref_audio_button = clear_ref_audio_button
+        self.ref_audio_hint = ref_hint
+        self._sync_ref_audio_hint()
 
         speed_label = wx.StaticText(panel, label="Speed:")
         speed_text_input = wx.TextCtrl(panel, value=str(self.settings.get('speed', 1.0)))
         self.selected_speed = float(speed_text_input.GetValue())
         speed_text_input.Bind(wx.EVT_TEXT, self.on_select_speed)
-        sizer.Add(speed_label, pos=(2, 0), flag=wx.ALL, border=border)
-        sizer.Add(speed_text_input, pos=(2, 1), flag=wx.ALL, border=border)
+        sizer.Add(speed_label, pos=(6, 0), flag=wx.ALL, border=border)
+        sizer.Add(speed_text_input, pos=(6, 1), flag=wx.ALL, border=border)
 
         ai_enabled_label = wx.StaticText(panel, label="AI Phonetic Check:")
         ai_enabled_checkbox = wx.CheckBox(panel, label="Enabled")
         ai_enabled_checkbox.SetValue(self.settings.get('gemini_enabled', False))
         ai_enabled_checkbox.Bind(wx.EVT_CHECKBOX, self.on_ai_enabled_changed)
         self.ai_enabled_checkbox = ai_enabled_checkbox
-        sizer.Add(ai_enabled_label, pos=(3, 0), flag=wx.ALL, border=border)
-        sizer.Add(ai_enabled_checkbox, pos=(3, 1), flag=wx.ALL, border=border)
+        sizer.Add(ai_enabled_label, pos=(7, 0), flag=wx.ALL, border=border)
+        sizer.Add(ai_enabled_checkbox, pos=(7, 1), flag=wx.ALL, border=border)
 
         api_key_label = wx.StaticText(panel, label="Gemini API Key:")
         api_key_text_input = wx.TextCtrl(panel, value=self.settings.get('gemini_api_key', ''), style=wx.TE_PASSWORD)
         api_key_text_input.Bind(wx.EVT_TEXT, self.on_ai_api_key_changed)
         self.ai_api_key_text_ctrl = api_key_text_input
-        sizer.Add(api_key_label, pos=(4, 0), flag=wx.ALL, border=border)
-        sizer.Add(api_key_text_input, pos=(4, 1), flag=wx.ALL | wx.EXPAND, border=border)
+        sizer.Add(api_key_label, pos=(8, 0), flag=wx.ALL, border=border)
+        sizer.Add(api_key_text_input, pos=(8, 1), flag=wx.ALL | wx.EXPAND, border=border)
 
         ai_model_label = wx.StaticText(panel, label="Gemini Model:")
         ai_model_choices = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-flash-lite-latest']
         ai_model_dropdown = wx.ComboBox(panel, choices=ai_model_choices, value=self.settings.get('gemini_model', 'gemini-3.1-flash-lite'))
         ai_model_dropdown.Bind(wx.EVT_COMBOBOX, self.on_ai_model_changed)
         self.ai_model_dropdown = ai_model_dropdown
-        sizer.Add(ai_model_label, pos=(5, 0), flag=wx.ALL, border=border)
-        sizer.Add(ai_model_dropdown, pos=(5, 1), flag=wx.ALL | wx.EXPAND, border=border)
+        sizer.Add(ai_model_label, pos=(9, 0), flag=wx.ALL, border=border)
+        sizer.Add(ai_model_dropdown, pos=(9, 1), flag=wx.ALL | wx.EXPAND, border=border)
 
         output_folder_label = wx.StaticText(panel, label="Output Folder:")
         initial_output_folder = self.settings.get('output_folder', os.path.abspath('.'))
@@ -335,9 +463,12 @@ class MainWindow(wx.Frame):
         self.output_folder_text_ctrl.SetEditable(False)
         output_folder_button = wx.Button(panel, label="📂 Select")
         output_folder_button.Bind(wx.EVT_BUTTON, self.open_output_folder_dialog)
-        sizer.Add(output_folder_label, pos=(6, 0), flag=wx.ALL, border=border)
-        sizer.Add(self.output_folder_text_ctrl, pos=(6, 1), flag=wx.ALL | wx.EXPAND, border=border)
-        sizer.Add(output_folder_button, pos=(7, 1), flag=wx.ALL, border=border)
+        sizer.Add(output_folder_label, pos=(10, 0), flag=wx.ALL, border=border)
+        sizer.Add(self.output_folder_text_ctrl, pos=(10, 1), flag=wx.ALL | wx.EXPAND, border=border)
+        sizer.Add(output_folder_button, pos=(11, 1), flag=wx.ALL, border=border)
+
+        self._update_engine_ui()
+        self._sync_ref_audio_text()
 
     def create_synthesis_panel(self):
         panel_box = wx.Panel(self.right_panel, style=wx.SUNKEN_BORDER)
@@ -382,6 +513,9 @@ class MainWindow(wx.Frame):
 
     def on_select_voice(self, event):
         self.selected_voice = event.GetString()
+        # The voice drives the Chatterbox preset, so refresh what it clones from.
+        self._sync_ref_audio_text()
+        self._sync_ref_audio_hint()
         self.save_current_settings()
 
     def on_select_speed(self, event):
@@ -405,6 +539,261 @@ class MainWindow(wx.Frame):
     def on_ai_model_changed(self, event):
         self.save_current_settings()
 
+    def _update_engine_ui(self):
+        chatterbox = bool(self.chatterbox_radio.GetValue())
+        # The voice dropdown and compute device stay visible for both engines:
+        # the dropdown picks the Kokoro voice *and* the Chatterbox voice preset,
+        # and the device drives Kokoro sample building plus Chatterbox itself.
+        self.compute_label.Show()
+        self.compute_radio_panel.Show()
+        self.voice_label.Show()
+        self.voice_dropdown.Show()
+
+        for widget in (self.voice_source_label, self.voice_source_radio_panel,
+                       self.ref_audio_label, self.ref_audio_text_input):
+            widget.Show(chatterbox)
+
+        # Preset mode builds samples; custom mode manages a picked WAV.
+        custom = chatterbox and self.get_preset_source() == 'custom'
+        self.ref_audio_button.Show(custom)
+        self.clear_ref_audio_button.Show(custom)
+        self.build_sample_button.Show(chatterbox and not custom)
+        self.build_all_button.Show(chatterbox and not custom)
+        self._sync_ref_audio_hint()
+        self.params_panel.Layout()
+        right_panel = getattr(self, 'right_panel', None)
+        if hasattr(right_panel, 'SetupScrolling'):
+            right_panel.SetupScrolling(scroll_x=False, scroll_y=True)
+
+    def _on_tts_engine_changed(self, engine):
+        self._update_engine_ui()
+        self.save_current_settings()
+
+    def on_voice_source_changed(self, source):
+        self._update_engine_ui()
+        self._sync_ref_audio_text()
+        self.save_current_settings()
+
+    def get_preset_source(self):
+        """'preset' (clone the selected Kokoro voice) or 'custom' (own WAV)."""
+        if getattr(self, 'custom_radio', None) and self.custom_radio.GetValue():
+            return 'custom'
+        return 'preset'
+
+    def open_ref_audio_dialog(self, event=None):
+        """Show the picker and return the chosen path, or '' if cancelled."""
+        with wx.FileDialog(self, "Open Reference Audio", wildcard="WAV files (*.wav)|*.wav|All files (*.*)|*.*",
+                           defaultDir=self.settings.get('last_open_dir') or os.path.expanduser('~'),
+                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dialog:
+            if dialog.ShowModal() == wx.ID_CANCEL:
+                return ''
+            path = dialog.GetPath()
+            self.selected_ref_audio = path
+            self.ref_audio_text_input.SetValue(path)
+            self._sync_ref_audio_hint()
+            self.save_current_settings()
+            return path
+
+    def on_select_ref_audio(self, event):
+        self.selected_ref_audio = self.ref_audio_text_input.GetValue()
+        self.save_current_settings()
+
+    def clear_ref_audio(self, event=None):
+        """Forget the configured Chatterbox reference audio."""
+        self.selected_ref_audio = ''
+        if getattr(self, 'ref_audio_text_input', None):
+            self.ref_audio_text_input.SetValue('')
+        self._sync_ref_audio_hint()
+        self.save_current_settings()
+
+    def _sync_ref_audio_text(self):
+        """Show whichever source is actually in effect in the read-only field."""
+        ctrl = getattr(self, 'ref_audio_text_input', None)
+        if ctrl is None:
+            return
+        path = self.get_ref_audio()
+        stored = getattr(self, 'selected_ref_audio', '')
+        if path:
+            ctrl.SetValue(path)
+        elif self.get_preset_source() == 'preset':
+            ctrl.SetValue('')          # no sample built yet for this voice
+        else:
+            ctrl.SetValue(stored if os.path.exists(stored) else '')
+
+    def _sync_ref_audio_hint(self):
+        """Report where the clone source comes from, or what is still missing."""
+        hint = getattr(self, 'ref_audio_hint', None)
+        if hint is None:
+            return
+        chatterbox = bool(getattr(self, 'chatterbox_radio', None) and self.chatterbox_radio.GetValue())
+        hint.Show(chatterbox)
+        if not chatterbox:
+            return
+
+        if self.get_preset_source() == 'custom':
+            stored = getattr(self, 'selected_ref_audio', '') or self.settings.get('chatterbox_ref_audio', '')
+            if not stored:
+                hint.SetLabel("⚠ Pick a WAV to clone a voice from.")
+                hint.SetForegroundColour(wx.Colour(200, 90, 0))
+            elif not os.path.exists(stored):
+                hint.SetLabel("⚠ Configured file is gone — select a new one.")
+                hint.SetForegroundColour(wx.Colour(200, 90, 0))
+            else:
+                hint.SetLabel(f"✓ Cloning: {os.path.basename(stored)}")
+                hint.SetForegroundColour(wx.Colour(0, 120, 0))
+            return
+
+        voice = self.get_selected_voice()
+        if voice_sample_exists(voice):
+            info = voice_sample_info(voice)
+            duration = info.get('duration_sec')
+            hint.SetLabel(f"✓ Preset: {voice}" + (f" ({duration}s)" if duration else ''))
+            hint.SetForegroundColour(wx.Colour(0, 120, 0))
+        else:
+            hint.SetLabel(f"⚠ No sample for {voice} — press 🎙 Build Sample.")
+            hint.SetForegroundColour(wx.Colour(200, 90, 0))
+
+    def get_ref_audio(self):
+        """Resolve the WAV Chatterbox should clone (voice preset or custom clip)."""
+        return resolve_chatterbox_ref_audio(
+            self.get_selected_voice(),
+            source=self.get_preset_source(),
+            custom_path=getattr(self, 'selected_ref_audio', '') or self.settings.get('chatterbox_ref_audio', ''),
+        )
+
+    def on_build_voice_sample(self, event=None, resume=False):
+        """Render the selected Kokoro voice into a Chatterbox preset clip."""
+        button = event.GetEventObject() if event is not None else getattr(self, 'build_sample_button', None)
+        voice = self.get_selected_voice()
+
+        def finish(ok, message=''):
+            def do_finish():
+                if button:
+                    button.SetLabel("🎙 Build Sample")
+                    button.Enable()
+                self._sync_ref_audio_text()
+                self._sync_ref_audio_hint()
+                if not ok:
+                    wx.MessageBox(message, "Voice Sample Error", wx.OK | wx.ICON_ERROR)
+                elif resume:
+                    self._resume_preview()
+            wx.CallAfter(do_finish)
+
+        if button:
+            button.SetLabel("⏳")
+            button.Disable()
+
+        def build():
+            try:
+                path = generate_voice_sample(voice, overwrite=True)
+                finish(bool(path), '' if path else f"Kokoro produced no audio for {voice}.")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                finish(False, str(e))
+
+        # fix #8: background thread so the GUI stays responsive while Kokoro runs.
+        thread = threading.Thread(target=build, daemon=True)
+        thread.start()
+        self.preview_threads.append(thread)
+        self.preview_threads = [t for t in self.preview_threads if t.is_alive()]
+
+    def on_build_all_samples(self, event=None):
+        """Render every Kokoro voice in the dropdown into a preset clip."""
+        all_voices = [v for lang_voices in voices.values() for v in lang_voices]
+        pending = missing_voice_samples(all_voices)
+        if not pending:
+            wx.MessageBox(f"All {len(all_voices)} voice presets are already built.",
+                          "Voice Samples", wx.OK | wx.ICON_INFORMATION)
+            return
+        if wx.MessageBox(f"Build {len(pending)} voice sample(s)? Kokoro renders each clip on the "
+                         f"selected device, so this can take a few minutes.",
+                         "Build Voice Samples", wx.YES_NO | wx.ICON_QUESTION) != wx.YES:
+            return
+
+        stop_event = threading.Event()
+        dialog = wx.ProgressDialog("Building voice samples", "Starting…",
+                                   maximum=len(pending), parent=self,
+                                   style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT | wx.PD_ELAPSED_TIME)
+        state = {'done': False, 'alive': True, 'error': ''}
+
+        def report(voice, path, done, total):
+            # Guarded: the user may cancel, after which the dialog is destroyed
+            # while this worker is still finishing the current voice.
+            if state['alive']:
+                wx.CallAfter(dialog.Update, done, f"{voice} ({done}/{total})")
+
+        def build_all():
+            try:
+                generate_voice_samples(pending, stop_event=stop_event, progress=report)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                state['error'] = str(e)
+            finally:
+                state['done'] = True
+                if state['alive']:
+                    wx.CallAfter(dialog.Update, len(pending), "Done")
+                    wx.CallAfter(dialog.EndModal, wx.ID_OK)
+
+        threading.Thread(target=build_all, daemon=True).start()
+        try:
+            while not state['done']:
+                # Nested event loop: renders the CallAfter updates and lets the
+                # user press Cancel, which returns without state['done'] set.
+                dialog.ShowModal()
+                if not state['done']:
+                    stop_event.set()
+                    print('Voice sample build cancelled by user.')
+                    break
+        finally:
+            state['alive'] = False
+            dialog.Destroy()
+        if state['error']:
+            wx.MessageBox(f"Error building voice samples: {state['error']}",
+                          "Voice Sample Error", wx.OK | wx.ICON_ERROR)
+        self._sync_ref_audio_text()
+        self._sync_ref_audio_hint()
+
+    def prompt_for_ref_audio(self, missing_path=''):
+        """UI-thread handler: resolve a missing clone source and resume the preview."""
+        if self.get_preset_source() == 'preset':
+            voice = self.get_selected_voice()
+            message = (f"No Chatterbox voice preset has been built for {voice} yet.\n\n"
+                       f"Build one now with Kokoro? It takes a few seconds and is then "
+                       f"reused every time this voice is selected.")
+        elif missing_path:
+            message = (f"The saved Chatterbox reference audio no longer exists:\n\n{missing_path}\n\n"
+                       "Pick a replacement WAV now?")
+        else:
+            message = ("Chatterbox clones a voice from a reference audio clip, so one is required.\n\n"
+                       "Pick a WAV file now?")
+        dialog = wx.MessageDialog(self, message, "Missing Reference Audio",
+                                  wx.YES_NO | wx.ICON_QUESTION)
+        try:
+            choice = dialog.ShowModal()
+        finally:
+            dialog.Destroy()
+        if choice != wx.ID_YES:
+            return
+        if self.get_preset_source() == 'preset':
+            self.on_build_voice_sample(resume=True)
+        else:
+            self.open_ref_audio_dialog()
+            if self.get_ref_audio():
+                self._resume_preview()
+
+    def _resume_preview(self):
+        """Re-run the preview that was interrupted by the reference audio prompt."""
+        if getattr(self, 'preview_button', None) and self.selected_chapter:
+            self.on_preview_chapter(None)
+
+    def get_selected_tts_engine(self):
+        return 'chatterbox' if self.chatterbox_radio.GetValue() else 'kokoro'
+
+    def get_chatterbox_device(self):
+        return 'cuda' if self.cuda_radio.GetValue() else 'cpu'
+
     def save_current_settings(self):
         """Save current GUI settings via core's save_settings."""
         output_folder = self.output_folder_text_ctrl.GetValue() if (hasattr(self, 'output_folder_text_ctrl') and self.output_folder_text_ctrl) else self.settings.get('output_folder', '.')
@@ -415,6 +804,11 @@ class MainWindow(wx.Frame):
         gemini_model = self.ai_model_dropdown.GetValue() if (hasattr(self, 'ai_model_dropdown') and self.ai_model_dropdown) else self.settings.get('gemini_model', 'gemini-3.1-flash-lite')
         gemini_enabled = self.ai_enabled_checkbox.GetValue() if (hasattr(self, 'ai_enabled_checkbox') and self.ai_enabled_checkbox) else self.settings.get('gemini_enabled', False)
         last_open_dir = self.last_open_dir if hasattr(self, 'last_open_dir') else self.settings.get('last_open_dir', '')
+        tts_engine = self.get_selected_tts_engine() if hasattr(self, 'chatterbox_radio') else self.settings.get('tts_engine', 'kokoro')
+        chatterbox_ref_audio = self.selected_ref_audio if hasattr(self, 'selected_ref_audio') else self.settings.get('chatterbox_ref_audio', '')
+        chatterbox_device = self.get_chatterbox_device() if hasattr(self, 'cuda_radio') else self.settings.get('chatterbox_device', 'cuda')
+        chatterbox_voice_source = self.get_preset_source() if hasattr(self, 'preset_radio') else self.settings.get('chatterbox_voice_source', 'preset')
+        voice_samples_dir = self.settings.get('voice_samples_dir', '')
 
         save_settings(
             output_folder=output_folder,
@@ -424,6 +818,11 @@ class MainWindow(wx.Frame):
             gemini_model=gemini_model,
             gemini_enabled=gemini_enabled,
             last_open_dir=last_open_dir,
+            tts_engine=tts_engine,
+            chatterbox_ref_audio=chatterbox_ref_audio,
+            chatterbox_device=chatterbox_device,
+            chatterbox_voice_source=chatterbox_voice_source,
+            voice_samples_dir=voice_samples_dir,
         )
 
     def open_epub(self, file_path):
@@ -491,6 +890,8 @@ class MainWindow(wx.Frame):
         self.splitter_left.Layout()
         self.splitter_right.Layout()
         self.splitter.Layout()
+        if hasattr(self.right_panel, 'SetupScrolling'):
+            self.right_panel.SetupScrolling(scroll_x=False, scroll_y=True)
 
         if self.selected_chapter:
             self.text_area.SetValue(self.selected_chapter.extracted_text)
@@ -548,13 +949,15 @@ class MainWindow(wx.Frame):
     def get_selected_speed(self):
         return float(self.selected_speed)
 
-    def on_preview_chapter(self, event):
+    def on_preview_chapter(self, event=None):
         if not self.selected_chapter:
             wx.MessageBox("No chapter selected for preview.", "Warning", wx.OK | wx.ICON_WARNING)
             return
 
-        voice = self.get_selected_voice()
-        button = event.GetEventObject()
+        engine = self.get_selected_tts_engine()
+        button = event.GetEventObject() if event is not None else getattr(self, 'preview_button', None)
+        if button is None:
+            return
         ai_enabled = self.ai_enabled_checkbox.GetValue()
         api_key = self.ai_api_key_text_ctrl.GetValue().strip() if ai_enabled else ''
         model = self.ai_model_dropdown.GetValue()
@@ -570,36 +973,70 @@ class MainWindow(wx.Frame):
             wx.MessageBox("Selected chapter has no text for preview.", "Warning", wx.OK | wx.ICON_WARNING)
             return
 
+        self._preview_seq = getattr(self, '_preview_seq', 0) + 1
+        preview_seq = self._preview_seq
+
         def reset_button():
-            wx.CallAfter(button.SetLabel, "🔊 Preview")
-            wx.CallAfter(button.Enable)
+            def do_reset():
+                if preview_seq != getattr(self, '_preview_seq', 0):
+                    return
+                button.SetLabel("🔊 Preview")
+                button.Enable()
+            wx.CallAfter(do_reset)
 
         button.SetLabel("⏳")
         button.Disable()
 
         def generate_preview():
             import audiblez.core as core
-            from kokoro import KPipeline
             try:
                 preview_text = text
                 if ai_enabled:
                     corrected = core.correct_phonetics_ai(
-                        text=preview_text, api_key=api_key, model=model)
+                        text=preview_text, api_key=api_key, model=model,
+                        tts_engine=engine)
                     if corrected and corrected.strip() and corrected != preview_text:
                         preview_text = corrected
 
-                pipeline = KPipeline(lang_code=core.lang_code_from_voice(voice))
-                audio_segments = core.gen_audio_segments(
-                    pipeline, preview_text, voice=voice, speed=self.get_selected_speed())
-
-                if not audio_segments:
-                    wx.CallAfter(wx.MessageBox, "Could not generate audio for preview.", "Error", wx.OK | wx.ICON_ERROR)
-                    return
-
-                final_audio = np.concatenate(audio_segments)
                 with NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                    soundfile.write(tmp, final_audio, core.sample_rate)
                     tmp_path = tmp.name
+
+                if engine == 'chatterbox':
+                    ref_audio = self.get_ref_audio()
+                    if not ref_audio:
+                        # Nothing to clone from yet: prompt_for_ref_audio builds
+                        # the voice preset (or asks for a WAV), then resumes.
+                        wx.CallAfter(self.prompt_for_ref_audio)
+                        return
+                    device = self.get_chatterbox_device()
+                    payload = json.dumps({
+                        "text": preview_text,
+                        "output_path": tmp_path,
+                        "device": device,
+                        "language_id": "en",
+                        "audio_prompt_path": ref_audio,
+                        "t3_model": "t3_mtl23ls_v3.safetensors",
+                    })
+                    proc = subprocess.run(
+                        [str(core.CHATTERBOX_BRIDGE_PYTHON), str(core.CHATTERBOX_BRIDGE_SCRIPT)],
+                        input=payload, capture_output=True, text=True
+                    )
+                    if proc.returncode != 0:
+                        raise RuntimeError(f"Chatterbox bridge failed: {proc.stderr}")
+                    result = _extract_bridge_json(proc.stdout)
+                    if not result.get('success'):
+                        raise RuntimeError(result.get('error', 'Unknown error'))
+                else:
+                    pipeline = KPipeline(lang_code=core.lang_code_from_voice(self.get_selected_voice()))
+                    audio_segments = core.gen_audio_segments(
+                        pipeline, preview_text, voice=self.get_selected_voice(), speed=self.get_selected_speed())
+
+                    if not audio_segments:
+                        wx.CallAfter(wx.MessageBox, "Could not generate audio for preview.", "Error", wx.OK | wx.ICON_ERROR)
+                        return
+
+                    final_audio = np.concatenate(audio_segments)
+                    soundfile.write(tmp_path, final_audio, core.sample_rate)
 
                 subprocess.run(['ffplay', '-autoexit', '-nodisp', tmp_path])
                 os.remove(tmp_path)
@@ -642,6 +1079,7 @@ class MainWindow(wx.Frame):
             return
 
         model = self.ai_model_dropdown.GetValue()
+        tts_engine = self.get_selected_tts_engine()
 
         button = event.GetEventObject()
         button.SetLabel("⏳")
@@ -653,7 +1091,8 @@ class MainWindow(wx.Frame):
                 result = core.check_phonetic_transcription_ai(
                     text=text,
                     api_key=api_key,
-                    model=model
+                    model=model,
+                    tts_engine=tts_engine
                 )
                 wx.CallAfter(self.show_ai_result_dialog, result)
             except Exception as e:
@@ -714,7 +1153,8 @@ class MainWindow(wx.Frame):
         self.core_thread = CoreThread(
             params=dict(file_path=file_path, voice=voice, pick_manually=False, speed=speed,
                         output_folder=self.output_folder_text_ctrl.GetValue(),
-                        selected_chapters=selected_chapters),
+                        selected_chapters=selected_chapters,
+                        tts_engine=self.get_selected_tts_engine()),
             stop_event=self.stop_event)
         self.core_thread.start()
 
