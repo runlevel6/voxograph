@@ -25,7 +25,8 @@ from .utils import _clamp_float, _clamp_int, _clamp_unit_float, strfdelta
 from .settings import load_settings, save_settings, is_chatterbox_model
 from .nlp import get_nlp, lang_code_from_voice, set_espeak_library
 from .gemini import (
-    correct_phonetics_ai, _sanitize_api_key, _AI_REWRITE_MAX_TOKENS,
+    correct_phonetics_ai_chapters, _sanitize_api_key,
+    _AI_REWRITE_MAX_TOKENS, _AI_MIN_AGGREGATE_TOKENS,
 )
 from .epub import (
     find_cover, find_document_chapters_and_extract_texts,
@@ -220,6 +221,65 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                 post_event('CORE_ERROR', message=f'Failed to initialize TTS pipeline: {e}')
             raise
 
+    # Cache-key tags are loop-invariant: they depend only on the engine/model
+    # and speed. Compute them once, then reuse them for both the AI pre-pass
+    # (which must know which chapter WAVs already exist) and the synth loop.
+    #
+    # Fix: include `speed` in the cache-key filename. Previously only `voice`
+    # was encoded, so re-running with a different speed would silently reuse
+    # WAVs generated at the old speed. Chatterbox WAVs are cached separately
+    # from Kokoro WAVs, so switching engines never silently reuses the other
+    # engine's output. Chatterbox has no speed control — exaggeration/CFG weight
+    # shape its output, so those go in the tag and the Kokoro speed stays out of
+    # it. Turbo ignores those knobs, so its tag names the model's sampling knobs
+    # instead, keeping Turbo and Multilingual audio from being interchangeable.
+    speed_tag = str(speed).replace('.', 'p')
+    engine_tag = ''
+    if tts_engine == 'chatterbox':
+        if chatterbox_model == CHATTERBOX_MODEL_TURBO:
+            engine_tag = ('_chatterbox_turbo'
+                          f'_t{_cache_tag_num(chatterbox_turbo_temperature)}'
+                          f'_p{_cache_tag_num(chatterbox_turbo_top_p)}'
+                          f'_k{chatterbox_turbo_top_k}'
+                          f'_rp{_cache_tag_num(chatterbox_turbo_repetition_penalty)}')
+        else:
+            engine_tag = ('_chatterbox'
+                          f'_ex{_cache_tag_num(chatterbox_exaggeration)}'
+                          f'_cfg{_cache_tag_num(chatterbox_cfg_weight)}')
+        speed_tag = ''
+
+    def _chapter_wav_path(i, chapter):
+        xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
+        return Path(output_folder) / filename.replace(
+            extension, f'_chapter_{i}_{voice}{engine_tag}_{speed_tag}_{xhtml_file_name}.wav')
+
+    # Rewrite every chapter that still needs synthesis in packed AI requests.
+    # Running before the loop lets small chapters be aggregated with the
+    # leading part of the next chapter instead of each becoming a tiny request.
+    # Chapters with an existing WAV are skipped here exactly as they are below,
+    # so resuming a run never re-bills them.
+    ai_rewritten = {}
+    if ai_enabled:
+        pending = []
+        for i, chapter in enumerate(selected_chapters, start=1):
+            if max_chapters is not None and i > max_chapters:
+                break
+            text = chapter.extracted_text
+            if len(text.strip()) < 10:
+                continue
+            if _chapter_wav_path(i, chapter).exists():
+                continue
+            pending.append((chapter.chapter_index, text))
+        if pending:
+            print(f'AI rewrite: {len(pending)} chapter(s), packed into requests of '
+                  f'~{_AI_REWRITE_MAX_TOKENS:,} tokens (chapters under '
+                  f'{_AI_MIN_AGGREGATE_TOKENS:,} tokens merge with the next).')
+            ai_rewritten = correct_phonetics_ai_chapters(
+                pending, ai_api_key, model=ai_model, stop_event=stop_event,
+                post_event=post_event, tts_engine=tts_engine,
+                chatterbox_model=chatterbox_model,
+                chapter_total=len(selected_chapters))
+
     chapter_wav_files = []
     try:
         for i, chapter in enumerate(selected_chapters, start=1):
@@ -229,35 +289,7 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
             if max_chapters is not None and i > max_chapters:
                 break
             text = chapter.extracted_text
-            xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
-            # Fix: include `speed` in the cache-key filename. Previously only
-            # `voice` was encoded, so re-running with a different speed would
-            # silently reuse WAVs generated at the old speed.
-            speed_tag = str(speed).replace('.', 'p')
-            # Chatterbox WAVs are cached separately from Kokoro WAVs, so switching
-            # engines never silently reuses the other engine's output. Chatterbox
-            # has no speed control — exaggeration/CFG weight shape its output, so
-            # those go in the tag and the Kokoro speed stays out of it. Turbo
-            # ignores those knobs, so its tag names the model instead; this also
-            # keeps Turbo and Multilingual audio from being reused interchangeably.
-            if tts_engine == 'chatterbox':
-                if chatterbox_model == CHATTERBOX_MODEL_TURBO:
-                    # Turbo's tag names the sampling knobs instead of the style
-                    # knobs V3 uses, so changing any of them re-synthesizes.
-                    engine_tag = ('_chatterbox_turbo'
-                                  f'_t{_cache_tag_num(chatterbox_turbo_temperature)}'
-                                  f'_p{_cache_tag_num(chatterbox_turbo_top_p)}'
-                                  f'_k{chatterbox_turbo_top_k}'
-                                  f'_rp{_cache_tag_num(chatterbox_turbo_repetition_penalty)}')
-                else:
-                    engine_tag = ('_chatterbox'
-                                  f'_ex{_cache_tag_num(chatterbox_exaggeration)}'
-                                  f'_cfg{_cache_tag_num(chatterbox_cfg_weight)}')
-                speed_tag = ''
-            else:
-                engine_tag = ''
-            chapter_wav_path = Path(output_folder) / filename.replace(
-                extension, f'_chapter_{i}_{voice}{engine_tag}_{speed_tag}_{xhtml_file_name}.wav')
+            chapter_wav_path = _chapter_wav_path(i, chapter)
             chapter_wav_files.append(chapter_wav_path)
 
             if Path(chapter_wav_path).exists():
@@ -273,23 +305,11 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                 # tracking doesn't permanently under-count the total.
                 stats.processed_chars += len(text)
                 continue
-            if ai_enabled:
-                if post_event:
-                    post_event('CORE_AI_REWRITE', chapter_index=chapter.chapter_index,
-                               chapter_total=len(selected_chapters),
-                               chunk_index=0, chunk_total=0)
-                print(f'AI rewrite: chapter {i} ({len(text):,} chars)')
-                text = correct_phonetics_ai(
-                    text, ai_api_key, model=ai_model,
-                    stop_event=stop_event, post_event=post_event,
-                    chapter_index=chapter.chapter_index,
-                    chapter_total=len(selected_chapters),
-                    tts_engine=tts_engine,
-                    chatterbox_model=chatterbox_model,
-                )
-                if stop_event and stop_event.is_set():
-                    print('Synthesis stopped by user during AI rewrite.')
-                    break
+            if ai_enabled and chapter.chapter_index in ai_rewritten:
+                text = ai_rewritten[chapter.chapter_index]
+            if stop_event and stop_event.is_set():
+                print('Synthesis stopped by user during AI rewrite.')
+                break
             if i == 1:
                 text = f'{title} – {creator}.\n\n' + text
 

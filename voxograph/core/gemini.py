@@ -318,6 +318,24 @@ _AI_PARAGRAPH_BREAK_RE = re.compile(r'\n+')
 _AI_SENTENCE_BREAK_RE = re.compile(r'(?<=[.!?])\s+')
 _AI_CLAUSE_BREAK_RE = re.compile(r'(?<=[,;:])\s+')
 
+# A chapter below this size (in rough tokens) is never sent to Gemini as its
+# own request: it is merged with the leading part of the next chapter so a
+# request is never a tiny, context-poor snippet.
+_AI_MIN_AGGREGATE_TOKENS = 15_000
+_AI_MIN_AGGREGATE_CHARS = _AI_MIN_AGGREGATE_TOKENS * _AI_REWRITE_CHARS_PER_TOKEN
+
+# Marker used to join several chapters into one request. The model is asked to
+# preserve it verbatim; the response is split back on it, and if it is not
+# preserved the unit falls back to one request per piece. The token itself is
+# bracketed with newlines when joining, but only the bare token is searched for
+# on the way back, so a dropped blank line still splits correctly.
+_AI_PART_MARKER = '<VX_PART_BREAK>'
+_AI_PART_JOIN = '\n\n' + _AI_PART_MARKER + '\n\n'
+
+# Below this many characters of slack it is not worth splitting the next
+# chapter just to top up a small unit; close the unit as-is instead.
+_AI_MIN_PREFIX_CHARS = 200
+
 
 def _ai_split_hard(segment, max_chars):
     """Last resort for a segment with no usable punctuation: break at word
@@ -404,6 +422,85 @@ def _ai_split_paragraphs(text, max_chars):
     return chunks
 
 
+def _ai_take_prefix(text, budget):
+    """Split `text` into (prefix, rest) with `len(prefix) <= budget`, cutting
+    at the coarsest real boundary that fits: paragraph -> sentence (.?!) ->
+    clause (,;:) -> word, then a hard cut as a last resort. Both halves are
+    stripped, so joining them back with a blank line restores the structure."""
+    if budget <= 0:
+        return '', text
+    if len(text) <= budget:
+        return text, ''
+
+    window = text[:budget]
+    for regex in (_AI_PARAGRAPH_BREAK_RE, _AI_SENTENCE_BREAK_RE, _AI_CLAUSE_BREAK_RE):
+        matches = list(regex.finditer(window))
+        if not matches:
+            continue
+        cut = matches[-1].end()
+        prefix, rest = text[:cut].strip(), text[cut:].strip()
+        if prefix:
+            return prefix, rest
+
+    cut = window.rfind(' ')
+    if cut > 0:
+        return text[:cut].strip(), text[cut + 1:].strip()
+    return text[:budget].strip(), text[budget:].strip()
+
+
+def _ai_pack_units(chapters, max_chars, min_chars):
+    """Pack (chapter_index, text) pairs into AI request units of <= max_chars.
+
+    Whole chapters are joined greedily until the next one would overflow. When
+    a unit would close below min_chars, the leading part of the next chapter is
+    pulled in (splitting that chapter at the coarsest boundary that fits) so
+    small chapters ride along with their neighbour instead of becoming their
+    own tiny request. Over-long chapters are pre-split into <= max_chars
+    fragments, which participate in the same packing.
+
+    Returns a list of units, each a list of (chapter_index, piece_text).
+    """
+    fragments = []
+    for chapter_index, text in chapters:
+        if len(text) <= max_chars:
+            fragments.append((chapter_index, text))
+        else:
+            for piece in _ai_split_paragraphs(text, max_chars):
+                fragments.append((chapter_index, piece))
+
+    units = []
+    current = []
+    current_len = 0
+    index = 0
+    while index < len(fragments):
+        chapter_index, text = fragments[index]
+        sep_len = len(_AI_PART_JOIN) if current else 0
+        if current and current_len + sep_len + len(text) > max_chars:
+            budget = max_chars - current_len - sep_len
+            if current_len < min_chars and budget >= _AI_MIN_PREFIX_CHARS:
+                prefix, rest = _ai_take_prefix(text, budget)
+                if prefix:
+                    current.append((chapter_index, prefix))
+                    units.append(current)
+                    current, current_len = [], 0
+                    fragments[index] = (chapter_index, rest)
+                    if not rest:
+                        index += 1
+                    continue
+                units.append(current)
+                current, current_len = [], 0
+                continue
+            units.append(current)
+            current, current_len = [], 0
+            continue
+        current.append((chapter_index, text))
+        current_len += sep_len + len(text)
+        index += 1
+    if current:
+        units.append(current)
+    return units
+
+
 def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
                          stop_event=None, post_event=None,
                          chapter_index=None, chapter_total=None, tts_engine='kokoro',
@@ -453,8 +550,84 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
             rewritten.append(out)
     return '\n\n'.join(rewritten)
 
+
+def _ai_rewrite_combined_unit(unit, api_key, model, stop_event=None, post_event=None,
+                              tts_engine='kokoro', chatterbox_model=None):
+    """Rewrite several chapters in one Gemini request, joined by
+    _AI_PART_MARKER, and return a list of rewritten pieces matching `unit`.
+
+    Falls back to one request per piece if the model does not preserve the
+    separators (or returns a piece count that does not match), so a stray
+    marker can never merge or drop a chapter's text.
+    """
+    combined = _AI_PART_JOIN.join(text for _, text in unit)
+    rewritten = _ai_rewrite_single_chunk(
+        combined, api_key, model, stop_event=stop_event, post_event=post_event,
+        tts_engine=tts_engine, chatterbox_model=chatterbox_model,
+        part_separator=_AI_PART_MARKER, part_count=len(unit))
+    parts = [part.strip() for part in rewritten.split(_AI_PART_MARKER)]
+    if len(parts) == len(unit) and all(parts):
+        return parts
+
+    print('\033[93mAI rewrite did not preserve chapter separators; '
+          'rewriting each chapter separately.\033[0m')
+    return [
+        _ai_rewrite_single_chunk(text, api_key, model, stop_event=stop_event,
+                                 post_event=post_event, tts_engine=tts_engine,
+                                 chatterbox_model=chatterbox_model)
+        for _, text in unit
+    ]
+
+
+def correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flash-lite',
+                                  stop_event=None, post_event=None, tts_engine='kokoro',
+                                  chatterbox_model=None, chapter_total=None):
+    """Rewrite a run of chapters for TTS, packing them into AI requests.
+
+    `chapters` is a list of (chapter_index, text). Chapters below
+    ~15K tokens are merged with the leading part of the next chapter, and
+    every request is kept at or below ~40K tokens (the chunks are packed whole
+    chapters first, splitting a chapter at a real boundary only to top up a
+    request that would otherwise close too small).
+
+    Returns a dict mapping chapter_index -> rewritten text. Chapters are joined
+    back with blank lines, mirroring correct_phonetics_ai's multi-chunk output.
+    """
+    if not chapters:
+        return {}
+
+    api_key = _sanitize_api_key(api_key)
+    if not api_key or not api_key.startswith('AIza'):
+        return {}
+
+    units = _ai_pack_units(chapters, _AI_REWRITE_MAX_CHARS, _AI_MIN_AGGREGATE_CHARS)
+    pieces_by_chapter = {}
+    for index, unit in enumerate(units, start=1):
+        if stop_event and stop_event.is_set():
+            break
+        if post_event:
+            post_event('CORE_AI_REWRITE', chapter_index=unit[0][0],
+                       chapter_total=chapter_total,
+                       chunk_index=index, chunk_total=len(units))
+        if len(unit) == 1:
+            chapter_index, text = unit[0]
+            rewritten = [_ai_rewrite_single_chunk(
+                text, api_key, model, stop_event=stop_event, post_event=post_event,
+                tts_engine=tts_engine, chatterbox_model=chatterbox_model)]
+        else:
+            rewritten = _ai_rewrite_combined_unit(
+                unit, api_key, model, stop_event=stop_event, post_event=post_event,
+                tts_engine=tts_engine, chatterbox_model=chatterbox_model)
+        for (chapter_index, _text), out in zip(unit, rewritten):
+            pieces_by_chapter.setdefault(chapter_index, []).append(out)
+
+    return {chapter_index: '\n\n'.join(piece for piece in pieces if piece)
+            for chapter_index, pieces in pieces_by_chapter.items()}
+
+
 def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=None,
-                             tts_engine='kokoro', chatterbox_model=None):
+                             tts_engine='kokoro', chatterbox_model=None,
+                             part_separator=None, part_count=0):
     """Single-chunk Gemini call used by correct_phonetics_ai. Falls back to
     the original text on any failure or invalid output (after retries).
 
@@ -462,9 +635,23 @@ def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=N
     force the model to explicitly enumerate foreign/unusual proper nouns
     before it writes the rewrite. Shares the engine-specific ruleset with
     check_phonetic_transcription_ai so both prompts apply identical rules.
+
+    When `part_separator` is set, `text` is several chapters joined by that
+    exact marker; the model is told to preserve every marker so the caller can
+    split the rewrite back into chapters.
     """
     engine_name = 'Chatterbox' if tts_engine == 'chatterbox' else 'Kokoro'
     rules = _phonetic_rules_for(tts_engine, chatterbox_model)
+
+    separator_instruction = ''
+    if part_separator and part_count > 1:
+        separator_instruction = (
+            f"The text is made of {part_count} chapters joined by the exact separator "
+            f"`{part_separator}`. Rewrite the whole text as one, but keep every separator "
+            "EXACTLY as written, in place, on its own — never translate, edit, remove, "
+            "duplicate or reorder a separator. The separators are the only reason the "
+            "rewritten chapters can be split back apart.\n\n"
+        )
 
     def _do_call():
         client = genai.Client(api_key=api_key)
@@ -486,6 +673,7 @@ def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=N
                 f"{rules}\n\n"
                 "Every proper noun you listed in Step 1 MUST be changed in some way in the "
                 "Step 2 rewrite.\n\n"
+                f"{separator_instruction}"
                 "FORMAT YOUR RESPONSE EXACTLY LIKE THIS (including the headers, nothing before or after):\n"
                 "===NAMES_FOUND===\n"
                 "<one name per line, or 'None found.'>\n"
