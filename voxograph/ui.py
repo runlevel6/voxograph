@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# A simple wxWidgets UI for audiblez
+# A simple wxWidgets UI for voxograph
 
 import torch.cuda
 import numpy as np
@@ -19,13 +19,13 @@ from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 # fix #9: import settings helpers from core — single source of truth
-from audiblez.core import (
+from voxograph.core import (
     load_settings, save_settings, DEFAULT_VOICE, check_phonetic_transcription_ai,
     correct_phonetics_ai, voice_sample_exists, voice_sample_info,
     generate_voice_sample, generate_voice_samples, missing_voice_samples,
     resolve_chatterbox_ref_audio,
 )
-from audiblez.voices import voices, flags
+from voxograph.voices import voices, flags
 
 EVENTS = {
     'CORE_STARTED': NewEvent(),
@@ -244,7 +244,7 @@ class MainWindow(wx.Frame):
                "Distributed under the MIT License.\n\n"
                "Originally by Claudio Santini 2025 — https://claudio.uk\n"
                "Fork by Vlad Reshetov 2025\n")
-        wx.MessageBox(msg, "Audiblez")
+        wx.MessageBox(msg, "Voxograph")
 
     def create_right_panel(self, splitter_right):
         # Scrolled: the parameters + synthesis panels can be taller than the
@@ -835,7 +835,7 @@ class MainWindow(wx.Frame):
         self.selected_file_path = file_path
         print(f"Opening file: {file_path}")
 
-        import audiblez.core as core
+        import voxograph.core as core
         from ebooklib import epub
 
         try:
@@ -988,7 +988,7 @@ class MainWindow(wx.Frame):
         button.Disable()
 
         def generate_preview():
-            import audiblez.core as core
+            import voxograph.core as core
             try:
                 preview_text = text
                 if ai_enabled:
@@ -1086,7 +1086,7 @@ class MainWindow(wx.Frame):
         button.Disable()
 
         def run_ai_check():
-            import audiblez.core as core
+            import voxograph.core as core
             try:
                 result = core.check_phonetic_transcription_ai(
                     text=text,
@@ -1194,7 +1194,7 @@ class MainWindow(wx.Frame):
         if self.synthesis_in_progress:
             answer = wx.MessageBox(
                 "Audiobook synthesis is still in progress.\nStop synthesis and exit?",
-                "Exit Audiblez", wx.YES_NO | wx.ICON_WARNING)
+                "Exit Voxograph", wx.YES_NO | wx.ICON_WARNING)
             if answer != wx.YES:
                 return
             if self.stop_event:
@@ -1224,7 +1224,7 @@ class CoreThread(threading.Thread):
         self.stop_event = stop_event
 
     def run(self):
-        import audiblez.core as core
+        import voxograph.core as core
         core.main(**self.params, stop_event=self.stop_event, post_event=self.post_event)
 
     def post_event(self, event_name, **kwargs):
@@ -1238,7 +1238,7 @@ class CoreThread(threading.Thread):
 def main():
     print('Starting GUI...')
     app = wx.App(False)
-    frame = MainWindow(None, "Audiblez - Generate Audiobooks from E-books")
+    frame = MainWindow(None, "Voxograph - Generate Audiobooks from E-books")
     frame.Show(True)
     frame.Layout()
     app.SetTopWindow(frame)

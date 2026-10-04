@@ -1,4 +1,4 @@
-"""audiblez.core.constants - Global constants shared across the package."""
+"""voxograph.core.constants - Global constants shared across the package."""
 
 
 from pathlib import Path
@@ -15,8 +15,8 @@ CONFIG_FILE = Path(__file__).resolve().parent.parent / 'config.json'
 
 # Default home for the rendered voice samples (one WAV per Kokoro voice) that
 # Chatterbox clones from. Kept outside the package directory on purpose: a
-# pip reinstall of audiblez wipes site-packages but must not wipe samples.
-DEFAULT_VOICE_SAMPLES_DIR = Path.home() / '.audiblez' / 'voice_samples'
+# pip reinstall of voxograph wipes site-packages but must not wipe samples.
+DEFAULT_VOICE_SAMPLES_DIR = Path.home() / '.voxograph' / 'voice_samples'
 
 # Chatterbox has no speed knob — these two shape delivery instead.
 # Exaggeration: how expressive/dramatic the speech is. Higher values also

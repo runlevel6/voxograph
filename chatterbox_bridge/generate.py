@@ -14,7 +14,7 @@ Two modes:
   * --serve: read newline-delimited JSON requests from stdin forever and
     write one newline-delimited JSON result per request to stdout. The
     model stays loaded in-process, so full-book synthesis pays the model
-    load cost exactly once. Used by audiblez core.main().
+    load cost exactly once. Used by voxograph core.main().
 """
 import sys
 

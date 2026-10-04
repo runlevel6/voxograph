@@ -1,4 +1,4 @@
-"""audiblez.core.epub - EPUB parsing, chapter extraction/selection, and CLI chapter display."""
+"""voxograph.core.epub - EPUB parsing, chapter extraction/selection, and CLI chapter display."""
 
 
 import ebooklib

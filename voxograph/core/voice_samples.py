@@ -1,4 +1,4 @@
-"""audiblez.core.voice_samples - Kokoro-rendered voice presets that Chatterbox clones from."""
+"""voxograph.core.voice_samples - Kokoro-rendered voice presets that Chatterbox clones from."""
 
 
 import json

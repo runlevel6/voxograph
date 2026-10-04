@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Headless builder for the Kokoro voice sample library used by Chatterbox.
 
-Run with the audiblez venv (Kokoro must be importable):
+Run with the voxograph venv (Kokoro must be importable):
 
     python voice_samples_cli.py --list
     python voice_samples_cli.py --voice af_heart --force
@@ -18,8 +18,8 @@ import threading
 
 import torch.cuda
 
-import audiblez.core as core
-from audiblez.voices import voices
+import voxograph.core as core
+from voxograph.voices import voices
 
 
 def all_voices(lang_codes):

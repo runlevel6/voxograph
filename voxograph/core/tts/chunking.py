@@ -1,4 +1,4 @@
-"""audiblez.core.tts.chunking - Sentence-aware chunking for Chatterbox synthesis."""
+"""voxograph.core.tts.chunking - Sentence-aware chunking for Chatterbox synthesis."""
 
 
 import re

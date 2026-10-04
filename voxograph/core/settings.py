@@ -1,4 +1,4 @@
-"""audiblez.core.settings - Settings persistence (single source of truth, fix #9)."""
+"""voxograph.core.settings - Settings persistence (single source of truth, fix #9)."""
 
 
 import json

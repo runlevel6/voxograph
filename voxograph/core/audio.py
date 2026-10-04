@@ -1,4 +1,4 @@
-"""audiblez.core.audio - ffmpeg M4B encoding, chapter metadata, duration probing, process utils."""
+"""voxograph.core.audio - ffmpeg M4B encoding, chapter metadata, duration probing, process utils."""
 
 
 import uuid

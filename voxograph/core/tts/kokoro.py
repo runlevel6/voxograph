@@ -1,4 +1,4 @@
-"""audiblez.core.tts.kokoro - Kokoro TTS segment generation."""
+"""voxograph.core.tts.kokoro - Kokoro TTS segment generation."""
 
 
 import soundfile

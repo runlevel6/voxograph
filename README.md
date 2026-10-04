@@ -1,8 +1,8 @@
-# Audiblez by runlevel6 — Enhanced Fork
+# Voxograph by runlevel6 — Enhanced Fork
 
 > This repository is an enhanced, feature-rich fork of [santinic/audiblez](https://github.com/santinic/audiblez).
 
-Audiblez generates `.m4b` audiobooks from regular `.epub` e-books,
+Voxograph generates `.m4b` audiobooks from regular `.epub` e-books,
 using Kokoro's high-quality speech synthesis.
 
 [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) is a recently published text-to-speech model with just 82M params and very natural sounding output.
@@ -14,13 +14,19 @@ On a Google Colab's T4 GPU via Cuda, **it takes about 5 minutes to convert "Anim
 On my M2 MacBook Pro, on CPU, it takes about 1 hour, at a rate of about 60 characters per second.
 
 
+## Acknowledgments & Credits
+
+This project originated as a fork of [Audiblez](https://github.com/santinic/audiblez) created by [Claudio Santini](https://github.com/santinic). 
+While it has been extensively refactored with enhanced text sanitization, custom pipeline features, and audio handling improvements, we are grateful to the original author and contributors for laying the foundation.
+
+
 ## Fork Enhancements
 
 This fork adds significant architectural improvements over the original project:
 
 - **Second TTS engine: Chatterbox Multilingual V3 (voice cloning)** — the GUI can synthesize the whole book with [Chatterbox](https://github.com/resemble-ai/chatterbox) instead of Kokoro. Because Chatterbox degrades on long inputs, chapters are split into ~300-character chunks at sentence (then clause, then word) boundaries and stitched back together, and the model is loaded **once per run** through a persistent bridge process, so the multi-second load is paid a single time instead of once per chapter. See [Second TTS engine: Chatterbox](#second-tts-engine-chatterbox).
 
-- **Named Chatterbox voices via a Kokoro-rendered sample library** — Chatterbox has no named voice list, so audiblez renders every Kokoro voice once into `~/.audiblez/voice_samples/<voice>.wav` (edge silence trimmed, peak normalized) and hands it to Chatterbox as the cloning prompt. The preset name is therefore the Kokoro voice name, and one dropdown serves both engines. **Build Sample** renders the selected voice in the background, **Build All** renders every voice in the dropdown, or switch the source to **Custom WAV** to clone a recording of your own. The same library is available headlessly via `python -m audiblez.voice_samples_cli --list | --voice af_heart | --all`.
+- **Named Chatterbox voices via a Kokoro-rendered sample library** — Chatterbox has no named voice list, so voxograph renders every Kokoro voice once into `~/.voxograph/voice_samples/<voice>.wav` (edge silence trimmed, peak normalized) and hands it to Chatterbox as the cloning prompt. The preset name is therefore the Kokoro voice name, and one dropdown serves both engines. **Build Sample** renders the selected voice in the background, **Build All** renders every voice in the dropdown, or switch the source to **Custom WAV** to clone a recording of your own. The same library is available headlessly via `python -m voxograph.voice_samples_cli --list | --voice af_heart | --all`.
 
 - **AI-Assisted Pronunciation Correction (Gemini)** — the flagship feature of this release. When **AI Phonetic Check** is enabled, each chapter is rewritten by Google Gemini *before* synthesis so Kokoro pronounces tricky words correctly. The model expands abbreviations (`Dr.` → `Doctor`, `NASA` → `N A S A`), spells out numbers and dates (`2024` → `twenty twenty four`, `3rd` → `third`), re-spells homophones and silent letters, and **always** rewrites foreign proper nouns — personal names, place names, military units — into an English-friendly spelling or an inline IPA override with stress marks (e.g. `Péronne` → `Peyron`). Plain English respelling is preferred when it is simpler and just as accurate; punctuation is preserved because it shapes prosody.
 
@@ -58,18 +64,18 @@ You also need `espeak-ng` and `ffmpeg` installed on your machine:
 
 ```bash
 sudo apt install ffmpeg espeak-ng                   # on Ubuntu/Debian 🐧
-pip install audiblez
+pip install voxograph
 ```
 
 ```bash
 brew install ffmpeg espeak-ng                       # on Mac 🍏
-pip install audiblez
+pip install voxograph
 ```
 
 Then you can convert an .epub directly with:
 
 ```
-audiblez book.epub -v af_sky
+voxograph book.epub -v af_sky
 ```
 
 It will first create a bunch of `book_chapter_1.wav`, `book_chapter_2.wav`, etc. files in the same directory,
@@ -80,19 +86,19 @@ It will only produce the `.m4b` file if you have `ffmpeg` installed on your mach
 
 ## How to run the GUI
 
-The GUI is a simple graphical interface to use audiblez.
+The GUI is a simple graphical interface to use voxograph.
 You need some extra dependencies to run the GUI:
 
 ```
 sudo apt install ffmpeg espeak-ng 
 sudo apt install libgtk-3-dev        # just for Ubuntu/Debian 🐧, Windows/Mac don't need this
   
-pip install audiblez pillow wxpython
+pip install voxograph pillow wxpython
 ```
 
 Then you can run the GUI with:
 ```
-audiblez-ui
+voxograph-ui
 ```
 
 
@@ -103,8 +109,8 @@ a voice from a short reference recording. Select it in the **TTS Engine** radio 
 *Audiobook Parameters* panel; the choice is stored in `config.json` (`tts_engine`) and is also what
 the command-line tool uses.
 
-Chatterbox is installed in a **separate virtualenv**, because it pins `torch==2.6.0` while audiblez
-needs a different build, and audiblez talks to it over a small bridge script:
+Chatterbox is installed in a **separate virtualenv**, because it pins `torch==2.6.0` while voxograph
+needs a different build, and voxograph talks to it over a small bridge script:
 
 ```bash
 python3 -m venv ~/chatterbox_venv
@@ -120,8 +126,8 @@ cp chatterbox_bridge/generate.py ~/chatterbox_venv/generate.py
 
 It reads one JSON request on stdin and writes one JSON result on stdout; in `--serve` mode it loops
 over newline-delimited requests so a whole book is synthesized with a single model load. Its location
-is baked into `audiblez/core.py` (`CHATTERBOX_BRIDGE_DIR`) and can be overridden with the
-`AUDIBLEZ_CHATTERBOX_BRIDGE_DIR` environment variable.
+is baked into `voxograph/core.py` (`CHATTERBOX_BRIDGE_DIR`) and can be overridden with the
+`VOXOGRAPH_CHATTERBOX_BRIDGE_DIR` environment variable.
 
 Note that Multilingual V3 needs a `t3_model="t3_mtl23ls_v3.safetensors"` argument on
 `ChatterboxMultilingualTTS.from_pretrained()`, which stock `chatterbox-tts==0.1.7` does not accept —
@@ -129,9 +135,9 @@ add the parameter (and thread it through `from_local()`) in your venv.
 
 Then pick the voice to clone:
 
-- **Voice Preset** — clones `~/.audiblez/voice_samples/<voice>.wav`, a Kokoro rendering of the voice
+- **Voice Preset** — clones `~/.voxograph/voice_samples/<voice>.wav`, a Kokoro rendering of the voice
   selected in the dropdown. Missing presets are built automatically (or with **Build Sample** /
-  **Build All**, or `python -m audiblez.voice_samples_cli --all`).
+  **Build All**, or `python -m voxograph.voice_samples_cli --all`).
 - **Custom WAV** — clones a recording you supply.
 
 Both engines then share the rest of the pipeline: chapter WAV caching, normalization, single-pass
@@ -145,15 +151,15 @@ Kokoro — expect a fraction of Kokoro's characters-per-second.
 
 ## How to run on Windows
 
-After many trials, on Windows we recommend to install audiblez in a Python venv:
+After many trials, on Windows we recommend to install voxograph in a Python venv:
 
 1. Open a Windows terminal
-2. Create anew folder: `mkdir audiblez`
-3. Enter the folder: `cd audiblez`
+2. Create anew folder: `mkdir voxograph`
+3. Enter the folder: `cd voxograph`
 4. Create a venv: `python -m venv venv`
 5. Activate the venv: `.\venv\Scripts\Activate.ps1`
-6. Install the dependencies: `pip install audiblez pillow wxpython`
-7. Now you can run `audiblez` or `audiblez-ui`
+6. Install the dependencies: `pip install voxograph pillow wxpython`
+7. Now you can run `voxograph` or `voxograph-ui`
 8. For Cuda support, you need to install Pytorch accordingly: https://pytorch.org/get-started/locally/
 
 
@@ -162,7 +168,7 @@ After many trials, on Windows we recommend to install audiblez in a Python venv:
 By default the audio is generated using a normal speed, but you can make it up to twice slower or faster by specifying a speed argument between 0.5 to 2.0:
 
 ```
-audiblez book.epub -v af_sky -s 1.5
+voxograph book.epub -v af_sky -s 1.5
 ```
 
 
@@ -190,7 +196,7 @@ For more detaila about voice quality, check this document: [Kokoro-82M voices](h
 
 ## How to run on GPU
 
-By default, audiblez runs on CPU. If you pass the option `--cuda` it will try to use the Cuda device via Torch.
+By default, voxograph runs on CPU. If you pass the option `--cuda` it will try to use the Cuda device via Torch.
 
 Check out this example: [Audiblez running on a Google Colab Notebook with Cuda ](https://colab.research.google.com/drive/164PQLowogprWQpRjKk33e-8IORAvqXKI?usp=sharing]).
 
@@ -205,10 +211,10 @@ To do so, you can use `--pick` to interactively choose the chapters to convert (
 
 ## Help page
 
-For all the options available, you can check the help page `audiblez --help`:
+For all the options available, you can check the help page `voxograph --help`:
 
 ```
-usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-c] [-o FOLDER] epub_file_path
+usage: voxograph [-h] [-v VOICE] [-p] [-s SPEED] [-c] [-o FOLDER] epub_file_path
 
 positional arguments:
   epub_file_path        Path to the epub file
@@ -225,10 +231,10 @@ options:
                         Output folder for the audiobook and temporary files
 
 example:
-  audiblez book.epub -l en-us -v af_sky
+  voxograph book.epub -l en-us -v af_sky
 
 to use the GUI, run:
-  audiblez-ui
+  voxograph-ui
 ```
 
 

@@ -1,4 +1,4 @@
-"""audiblez.core.pipeline - Top-level audiobook synthesis pipeline (core.main)."""
+"""voxograph.core.pipeline - Top-level audiobook synthesis pipeline (core.main)."""
 
 
 import torch.cuda

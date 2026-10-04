@@ -1,4 +1,4 @@
-"""audiblez.core.tts.chatterbox - Persistent Chatterbox bridge and per-chapter synthesis."""
+"""voxograph.core.tts.chatterbox - Persistent Chatterbox bridge and per-chapter synthesis."""
 
 
 import os
@@ -23,7 +23,7 @@ from .chunking import split_chatterbox_text
 
 
 CHATTERBOX_BRIDGE_DIR = Path(
-    os.environ.get('AUDIBLEZ_CHATTERBOX_BRIDGE_DIR', '/home/vlad/chatterbox_venv'))
+    os.environ.get('VOXOGRAPH_CHATTERBOX_BRIDGE_DIR', '/home/vlad/chatterbox_venv'))
 CHATTERBOX_BRIDGE_PYTHON = CHATTERBOX_BRIDGE_DIR / 'bin' / 'python3'
 CHATTERBOX_BRIDGE_SCRIPT = CHATTERBOX_BRIDGE_DIR / 'generate.py'
 CHATTERBOX_T3_MODEL = 't3_mtl23ls_v3.safetensors'
@@ -183,7 +183,7 @@ def gen_audio_segments_chatterbox(bridge, text, stats=None, max_chunks=None,
     # chunks sum to slightly fewer chars than the source. Add that back on the
     # final chunk so per-chapter progress can actually reach 100%.
     separator_chars = max(0, len(text) - sum(len(c) for c in chunks))
-    tmp_dir = tempfile.mkdtemp(prefix='audiblez_chatterbox_')
+    tmp_dir = tempfile.mkdtemp(prefix='voxograph_chatterbox_')
     try:
         for idx, chunk in enumerate(chunks, start=1):
             if stop_event and stop_event.is_set():

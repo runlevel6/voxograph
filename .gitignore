@@ -7,7 +7,7 @@ __pycache__/
 venv/
 
 # Secrets (contains Gemini API key / user settings)
-audiblez/config.json
+voxograph/config.json
 config.json
 
 # Generated audio / intermediate files

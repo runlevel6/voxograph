@@ -1,4 +1,4 @@
-"""audiblez.core.nlp - spaCy model caching, espeak-ng setup, and Kokoro lang-code helper."""
+"""voxograph.core.nlp - spaCy model caching, espeak-ng setup, and Kokoro lang-code helper."""
 
 
 import os

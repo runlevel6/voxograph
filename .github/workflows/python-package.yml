@@ -1,4 +1,4 @@
-name: Python package
+name: Voxograph package
 
 on:
   push:
@@ -38,4 +38,4 @@ jobs:
         run: python -m pip install .
 
       - name: Check CLI entry point
-        run: audiblez --help
+        run: voxograph --help

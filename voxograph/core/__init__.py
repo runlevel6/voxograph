@@ -1,5 +1,5 @@
-"""audiblez.core - public API re-exports for the split modules."""
-from audiblez.core.constants import (
+"""voxograph.core - public API re-exports for the split modules."""
+from voxograph.core.constants import (
     CHATTERBOX_DEFAULT_CFG_WEIGHT,
     CHATTERBOX_DEFAULT_EXAGGERATION,
     CHATTERBOX_DEFAULT_MODEL,
@@ -13,17 +13,17 @@ from audiblez.core.constants import (
     _SPOKEN_CHARS_PER_SEC,
     sample_rate,
 )
-from audiblez.core.utils import (
+from voxograph.core.utils import (
     _apply_fade,
     _clamp_unit_float,
     strfdelta,
 )
-from audiblez.core.settings import (
+from voxograph.core.settings import (
     is_chatterbox_model,
     load_settings,
     save_settings,
 )
-from audiblez.core.text import (
+from voxograph.core.text import (
     ABBREVIATIONS,
     _ABBREV_PATTERNS,
     _ROMAN_HEADING_RE,
@@ -35,14 +35,14 @@ from audiblez.core.text import (
     clean_text,
     expand_roman_numerals,
 )
-from audiblez.core.nlp import (
+from voxograph.core.nlp import (
     _nlp,
     get_nlp,
     lang_code_from_voice,
     load_spacy,
     set_espeak_library,
 )
-from audiblez.core.gemini import (
+from voxograph.core.gemini import (
     _AI_REWRITE_CHARS_PER_TOKEN,
     _AI_REWRITE_MAX_CHARS,
     _AI_REWRITE_MAX_TOKENS,
@@ -61,7 +61,7 @@ from audiblez.core.gemini import (
     check_phonetic_transcription_ai,
     correct_phonetics_ai,
 )
-from audiblez.core.epub import (
+from voxograph.core.epub import (
     chapter_beginning_one_liner,
     find_cover,
     find_document_chapters_and_extract_texts,
@@ -70,14 +70,14 @@ from audiblez.core.epub import (
     pick_chapters,
     print_selected_chapters,
 )
-from audiblez.core.audio import (
+from voxograph.core.audio import (
     _popen_run,
     create_index_file,
     create_m4b,
     delete_wav_files,
     probe_duration,
 )
-from audiblez.core.voice_samples import (
+from voxograph.core.voice_samples import (
     CHATTERBOX_VOICE_SOURCES,
     VOICE_SAMPLE_INDEX,
     VOICE_SAMPLE_MIN_SECONDS,
@@ -96,14 +96,14 @@ from audiblez.core.voice_samples import (
     voice_sample_path,
     voice_samples_dir,
 )
-from audiblez.core.pipeline import (
+from voxograph.core.pipeline import (
     main,
 )
-from audiblez.core.tts.kokoro import (
+from voxograph.core.tts.kokoro import (
     gen_audio_segments,
     gen_text,
 )
-from audiblez.core.tts.chunking import (
+from voxograph.core.tts.chunking import (
     CHATTERBOX_MAX_CHUNK_CHARS,
     _CLAUSE_BOUNDARY_RE,
     _SENTENCE_BOUNDARY_RE,
@@ -111,7 +111,7 @@ from audiblez.core.tts.chunking import (
     preview_excerpt,
     split_chatterbox_text,
 )
-from audiblez.core.tts.chatterbox import (
+from voxograph.core.tts.chatterbox import (
     CHATTERBOX_BRIDGE_DIR,
     CHATTERBOX_BRIDGE_PYTHON,
     CHATTERBOX_BRIDGE_SCRIPT,

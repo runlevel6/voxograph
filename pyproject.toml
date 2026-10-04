@@ -1,5 +1,5 @@
 [project]
-name = "audiblez"
+name = "voxograph"
 version = "0.5.0"
 description = "Generate audiobooks from EPUB e-books using Kokoro speech synthesis"
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -51,14 +51,14 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/runlevel6/audiblez"
-Repository = "https://github.com/runlevel6/audiblez"
-Issues = "https://github.com/runlevel6/audiblez/issues"
+Homepage = "https://github.com/runlevel6/voxograph"
+Repository = "https://github.com/runlevel6/voxograph"
+Issues = "https://github.com/runlevel6/voxograph/issues"
 Original = "https://github.com/santinic/audiblez"
 
 [project.scripts]
-audiblez = "audiblez.cli:cli_main"
-audiblez-ui = "audiblez.ui:main"
+voxograph = "voxograph.cli:cli_main"
+voxograph-ui = "voxograph.ui:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -66,4 +66,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["audiblez*"]
+include = ["voxograph*"]

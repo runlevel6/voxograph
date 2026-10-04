@@ -1,4 +1,4 @@
-"""audiblez.core.utils - Small shared helpers (clamping, fades, time formatting)."""
+"""voxograph.core.utils - Small shared helpers (clamping, fades, time formatting)."""
 
 
 import numpy as np

@@ -1,4 +1,4 @@
-"""audiblez.core.text - Text cleaning: abbreviations, Roman numerals, Unicode punctuation."""
+"""voxograph.core.text - Text cleaning: abbreviations, Roman numerals, Unicode punctuation."""
 
 
 import re

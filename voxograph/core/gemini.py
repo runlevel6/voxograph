@@ -1,4 +1,4 @@
-"""audiblez.core.gemini - Gemini retry helper, phonetic rules, and AI pronunciation rewrites."""
+"""voxograph.core.gemini - Gemini retry helper, phonetic rules, and AI pronunciation rewrites."""
 
 
 import time
