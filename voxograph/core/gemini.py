@@ -4,6 +4,18 @@
 import re
 import time
 from google import genai
+from google.genai import types
+
+
+# Explicitly request the largest output budget Gemini accepts, overriding the
+# SDK/model default, so long phonetic rewrites are never silently truncated.
+# Applied as GenerateContentConfig(max_output_tokens=...) on every API call.
+_AI_MAX_OUTPUT_TOKENS = 65536
+
+
+def _ai_generate_config():
+    """Build the generation config shared by every Gemini call in this module."""
+    return types.GenerateContentConfig(max_output_tokens=_AI_MAX_OUTPUT_TOKENS)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +288,8 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
                 "them in your analysis, even if you're only approximating the pronunciation.\n\n"
                 "If the text looks clean with no obvious issues, say so and provide a brief confirmation.\n\n"
                 f"Text to analyze:\n\"\"\"\n{text}\n\"\"\""
-            )
+            ),
+            config=_ai_generate_config(),
         )
 
     try:
@@ -307,8 +320,8 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
 
 # Rough char-to-token ratio used to size Gemini requests for the
 # phonetic rewriter. ~4 chars/token is a defensible average for English
-# prose, so 40K tokens ~= 160K characters of payload per request.
-_AI_REWRITE_MAX_TOKENS = 40_000
+# prose, so 8K tokens ~= 32K characters of payload per request.
+_AI_REWRITE_MAX_TOKENS = 8_000
 _AI_REWRITE_CHARS_PER_TOKEN = 4
 _AI_REWRITE_MAX_CHARS = _AI_REWRITE_MAX_TOKENS * _AI_REWRITE_CHARS_PER_TOKEN
 
@@ -321,7 +334,7 @@ _AI_CLAUSE_BREAK_RE = re.compile(r'(?<=[,;:])\s+')
 # A chapter below this size (in rough tokens) is never sent to Gemini as its
 # own request: it is merged with the leading part of the next chapter so a
 # request is never a tiny, context-poor snippet.
-_AI_MIN_AGGREGATE_TOKENS = 15_000
+_AI_MIN_AGGREGATE_TOKENS = 1_000
 _AI_MIN_AGGREGATE_CHARS = _AI_MIN_AGGREGATE_TOKENS * _AI_REWRITE_CHARS_PER_TOKEN
 
 # Marker used to join several chapters into one request. The model is asked to
@@ -508,8 +521,8 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
     """
     Use Google Gemini AI to silently rewrite text for TTS-friendly pronunciation.
 
-    For long inputs the text is split into chunks of at most ~40K tokens
-    (≈ 160K chars) and each chunk is rewritten in its own request. The
+    For long inputs the text is split into chunks of at most ~8K tokens
+    (≈ 32K chars) and each chunk is rewritten in its own request. The
     chunks are joined with blank lines to mirror the paragraph structure
     of the input.
 
@@ -579,50 +592,85 @@ def _ai_rewrite_combined_unit(unit, api_key, model, stop_event=None, post_event=
     ]
 
 
+def _rewrite_packed_unit(unit, api_key, model, stop_event=None, post_event=None,
+                         tts_engine='kokoro', chatterbox_model=None):
+    """Rewrite exactly one packed AI unit and return the rewritten piece texts
+    in the same order as `unit`. A single-piece unit is a plain request; a
+    multi-piece unit is joined with the part marker and split back."""
+    if len(unit) == 1:
+        return [_ai_rewrite_single_chunk(
+            unit[0][1], api_key, model, stop_event=stop_event, post_event=post_event,
+            tts_engine=tts_engine, chatterbox_model=chatterbox_model)]
+    return _ai_rewrite_combined_unit(
+        unit, api_key, model, stop_event=stop_event, post_event=post_event,
+        tts_engine=tts_engine, chatterbox_model=chatterbox_model)
+
+
+def iter_correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flash-lite',
+                                       stop_event=None, post_event=None, tts_engine='kokoro',
+                                       chatterbox_model=None, chapter_total=None):
+    """Rewrite a run of chapters for TTS, one packed AI request at a time.
+
+    `chapters` is a list of (chapter_index, text). Chapters below
+    ~1K tokens are merged with the leading part of the next chapter, and
+    every request is kept at or below ~8K tokens (whole chapters are packed
+    first, splitting a chapter at a real boundary only to top up a request
+    that would otherwise close too small).
+
+    Yields (chapter_index, rewritten_text) as soon as every piece of that
+    chapter has been rewritten, in chapter order. Because this is a generator,
+    the caller drives it lazily: TTS can run on each chapter before the next
+    AI request is issued, spreading the API calls out in time (AI -> TTS ->
+    AI -> TTS) instead of firing every request up front.
+    """
+    if not chapters:
+        return
+
+    api_key = _sanitize_api_key(api_key)
+    if not api_key or not api_key.startswith('AIza'):
+        return
+
+    units = _ai_pack_units(chapters, _AI_REWRITE_MAX_CHARS, _AI_MIN_AGGREGATE_CHARS)
+
+    # How many pieces each chapter is split into across the units. A chapter is
+    # only yielded once all of its pieces have come back.
+    pieces_total = {}
+    for unit in units:
+        for chapter_index, _text in unit:
+            pieces_total[chapter_index] = pieces_total.get(chapter_index, 0) + 1
+
+    pieces_by_chapter = {}
+    for index, unit in enumerate(units, start=1):
+        if stop_event and stop_event.is_set():
+            return
+        if post_event:
+            post_event('CORE_AI_REWRITE', chapter_index=unit[0][0],
+                       chapter_total=chapter_total,
+                       chunk_index=index, chunk_total=len(units))
+        rewritten = _rewrite_packed_unit(
+            unit, api_key, model, stop_event=stop_event, post_event=post_event,
+            tts_engine=tts_engine, chatterbox_model=chatterbox_model)
+        for (chapter_index, _text), out in zip(unit, rewritten):
+            pieces = pieces_by_chapter.setdefault(chapter_index, [])
+            pieces.append(out)
+            if len(pieces) >= pieces_total[chapter_index]:
+                yield chapter_index, '\n\n'.join(piece for piece in pieces if piece)
+
+
 def correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flash-lite',
                                   stop_event=None, post_event=None, tts_engine='kokoro',
                                   chatterbox_model=None, chapter_total=None):
     """Rewrite a run of chapters for TTS, packing them into AI requests.
 
-    `chapters` is a list of (chapter_index, text). Chapters below
-    ~15K tokens are merged with the leading part of the next chapter, and
-    every request is kept at or below ~40K tokens (the chunks are packed whole
-    chapters first, splitting a chapter at a real boundary only to top up a
-    request that would otherwise close too small).
-
-    Returns a dict mapping chapter_index -> rewritten text. Chapters are joined
-    back with blank lines, mirroring correct_phonetics_ai's multi-chunk output.
+    Eager variant of iter_correct_phonetics_ai_chapters: consumes the whole
+    series up front and returns a dict mapping chapter_index -> rewritten text.
+    Chapters are joined back with blank lines, mirroring correct_phonetics_ai's
+    multi-chunk output.
     """
-    if not chapters:
-        return {}
-
-    api_key = _sanitize_api_key(api_key)
-    if not api_key or not api_key.startswith('AIza'):
-        return {}
-
-    units = _ai_pack_units(chapters, _AI_REWRITE_MAX_CHARS, _AI_MIN_AGGREGATE_CHARS)
-    pieces_by_chapter = {}
-    for index, unit in enumerate(units, start=1):
-        if stop_event and stop_event.is_set():
-            break
-        if post_event:
-            post_event('CORE_AI_REWRITE', chapter_index=unit[0][0],
-                       chapter_total=chapter_total,
-                       chunk_index=index, chunk_total=len(units))
-        if len(unit) == 1:
-            chapter_index, text = unit[0]
-            rewritten = [_ai_rewrite_single_chunk(
-                text, api_key, model, stop_event=stop_event, post_event=post_event,
-                tts_engine=tts_engine, chatterbox_model=chatterbox_model)]
-        else:
-            rewritten = _ai_rewrite_combined_unit(
-                unit, api_key, model, stop_event=stop_event, post_event=post_event,
-                tts_engine=tts_engine, chatterbox_model=chatterbox_model)
-        for (chapter_index, _text), out in zip(unit, rewritten):
-            pieces_by_chapter.setdefault(chapter_index, []).append(out)
-
-    return {chapter_index: '\n\n'.join(piece for piece in pieces if piece)
-            for chapter_index, pieces in pieces_by_chapter.items()}
+    return dict(iter_correct_phonetics_ai_chapters(
+        chapters, api_key, model=model, stop_event=stop_event, post_event=post_event,
+        tts_engine=tts_engine, chatterbox_model=chatterbox_model,
+        chapter_total=chapter_total))
 
 
 def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=None,
@@ -680,7 +728,8 @@ def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=N
                 "===REWRITTEN_TEXT===\n"
                 "<the full rewritten text, nothing else — no commentary, no quotes, no labels>\n\n"
                 f"Text:\n\"\"\"\n{text}\n\"\"\""
-            )
+            ),
+            config=_ai_generate_config(),
         )
 
     try:

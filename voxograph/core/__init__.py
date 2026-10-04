@@ -53,6 +53,7 @@ from voxograph.core.nlp import (
     set_espeak_library,
 )
 from voxograph.core.gemini import (
+    _AI_MAX_OUTPUT_TOKENS,
     _AI_MIN_AGGREGATE_CHARS,
     _AI_MIN_AGGREGATE_TOKENS,
     _AI_REWRITE_CHARS_PER_TOKEN,
@@ -74,6 +75,7 @@ from voxograph.core.gemini import (
     check_phonetic_transcription_ai,
     correct_phonetics_ai,
     correct_phonetics_ai_chapters,
+    iter_correct_phonetics_ai_chapters,
 )
 from voxograph.core.epub import (
     chapter_beginning_one_liner,
@@ -180,6 +182,7 @@ __all__ = [
     'clean_text',
     'correct_phonetics_ai',
     'correct_phonetics_ai_chapters',
+    'iter_correct_phonetics_ai_chapters',
     'create_index_file',
     'create_m4b',
     'delete_wav_files',

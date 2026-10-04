@@ -25,7 +25,7 @@ from .utils import _clamp_float, _clamp_int, _clamp_unit_float, strfdelta
 from .settings import load_settings, save_settings, is_chatterbox_model
 from .nlp import get_nlp, lang_code_from_voice, set_espeak_library
 from .gemini import (
-    correct_phonetics_ai_chapters, _sanitize_api_key,
+    iter_correct_phonetics_ai_chapters, _sanitize_api_key,
     _AI_REWRITE_MAX_TOKENS, _AI_MIN_AGGREGATE_TOKENS,
 )
 from .epub import (
@@ -253,14 +253,15 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
         return Path(output_folder) / filename.replace(
             extension, f'_chapter_{i}_{voice}{engine_tag}_{speed_tag}_{xhtml_file_name}.wav')
 
-    # Rewrite every chapter that still needs synthesis in packed AI requests.
-    # Running before the loop lets small chapters be aggregated with the
-    # leading part of the next chapter instead of each becoming a tiny request.
-    # Chapters with an existing WAV are skipped here exactly as they are below,
-    # so resuming a run never re-bills them.
-    ai_rewritten = {}
+    # Collect the chapters that still need synthesis and must be rewritten by
+    # AI first. Chapters with an existing WAV and <10-char chapters are skipped
+    # here exactly as they are in the loop below, so resuming a run never
+    # re-bills them. The AI rewrites are produced lazily, one packed request at
+    # a time, and each request is followed by the TTS of the chapter(s) it
+    # finished before the next request is sent — so AI and TTS interleave as
+    # AI -> TTS -> AI -> TTS, spreading the API calls out in time.
+    pending_ai = []
     if ai_enabled:
-        pending = []
         for i, chapter in enumerate(selected_chapters, start=1):
             if max_chapters is not None and i > max_chapters:
                 break
@@ -269,16 +270,23 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                 continue
             if _chapter_wav_path(i, chapter).exists():
                 continue
-            pending.append((chapter.chapter_index, text))
-        if pending:
-            print(f'AI rewrite: {len(pending)} chapter(s), packed into requests of '
+            pending_ai.append((chapter.chapter_index, text))
+        if pending_ai:
+            print(f'AI rewrite: {len(pending_ai)} chapter(s), packed into requests of '
                   f'~{_AI_REWRITE_MAX_TOKENS:,} tokens (chapters under '
-                  f'{_AI_MIN_AGGREGATE_TOKENS:,} tokens merge with the next).')
-            ai_rewritten = correct_phonetics_ai_chapters(
-                pending, ai_api_key, model=ai_model, stop_event=stop_event,
-                post_event=post_event, tts_engine=tts_engine,
-                chatterbox_model=chatterbox_model,
-                chapter_total=len(selected_chapters))
+                  f'{_AI_MIN_AGGREGATE_TOKENS:,} tokens merge with the next). Each '
+                  f'request is sent only after the previous chapter\'s TTS finishes.')
+
+    ai_rewrites = (
+        iter_correct_phonetics_ai_chapters(
+            pending_ai, ai_api_key, model=ai_model, stop_event=stop_event,
+            post_event=post_event, tts_engine=tts_engine,
+            chatterbox_model=chatterbox_model,
+            chapter_total=len(selected_chapters))
+        if pending_ai else iter(()))
+    # First request goes out now; its chapter is synthesized before the next
+    # request is pulled from the generator (see the advance at the loop tail).
+    next_ai = next(ai_rewrites, None)
 
     chapter_wav_files = []
     try:
@@ -305,8 +313,11 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                 # tracking doesn't permanently under-count the total.
                 stats.processed_chars += len(text)
                 continue
-            if ai_enabled and chapter.chapter_index in ai_rewritten:
-                text = ai_rewritten[chapter.chapter_index]
+
+            ai_applied = False
+            if next_ai is not None and next_ai[0] == chapter.chapter_index:
+                text = next_ai[1]
+                ai_applied = True
             if stop_event and stop_event.is_set():
                 print('Synthesis stopped by user during AI rewrite.')
                 break
@@ -355,6 +366,12 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
             else:
                 print(f'Warning: No audio generated for chapter {i}')
                 chapter_wav_files.remove(chapter_wav_path)
+
+            # Only now — after this chapter's audio is done — do we ask the
+            # generator for the next rewrite. That pulls the next packed AI
+            # request, so the next Gemini call is sent after TTS, not before.
+            if ai_applied:
+                next_ai = next(ai_rewrites, None)
     finally:
         if bridge is not None:
             bridge.close()
