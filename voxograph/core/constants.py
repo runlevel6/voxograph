@@ -26,6 +26,18 @@ DEFAULT_VOICE_SAMPLES_DIR = Path.home() / '.voxograph' / 'voice_samples'
 CHATTERBOX_DEFAULT_EXAGGERATION = 0.5
 CHATTERBOX_DEFAULT_CFG_WEIGHT = 0.5
 
+# Turbo ignores exaggeration/CFG weight (its T3 config disables emotion
+# conditioning and hard-codes CFG to 0.0), but exposes these sampling knobs.
+# Defaults mirror ChatterboxTurboTTS.generate() so an unset value is a no-op.
+CHATTERBOX_TURBO_DEFAULT_TEMPERATURE = 0.8
+CHATTERBOX_TURBO_DEFAULT_TOP_P = 0.95
+CHATTERBOX_TURBO_DEFAULT_TOP_K = 1000
+CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY = 1.2
+CHATTERBOX_TURBO_TEMPERATURE_RANGE = (0.0, 2.0)
+CHATTERBOX_TURBO_TOP_P_RANGE = (0.0, 1.0)
+CHATTERBOX_TURBO_TOP_K_RANGE = (0, 100000)
+CHATTERBOX_TURBO_REPETITION_PENALTY_RANGE = (1.0, 2.0)
+
 # Which Chatterbox model to synthesize with. 'multilingual' is the Multilingual
 # V3 model (English-locked here, 23 languages available); 'turbo' is the smaller,
 # faster English-only model with native paralinguistic tags but no CFG/exaggeration.

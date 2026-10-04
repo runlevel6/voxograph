@@ -16,8 +16,12 @@ from .constants import (
     DEFAULT_VOICE, DEFAULT_VOICE_SAMPLES_DIR,
     CHATTERBOX_DEFAULT_EXAGGERATION, CHATTERBOX_DEFAULT_CFG_WEIGHT,
     CHATTERBOX_DEFAULT_MODEL, CHATTERBOX_MODEL_TURBO,
+    CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, CHATTERBOX_TURBO_DEFAULT_TOP_P,
+    CHATTERBOX_TURBO_DEFAULT_TOP_K, CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY,
+    CHATTERBOX_TURBO_TEMPERATURE_RANGE, CHATTERBOX_TURBO_TOP_P_RANGE,
+    CHATTERBOX_TURBO_TOP_K_RANGE, CHATTERBOX_TURBO_REPETITION_PENALTY_RANGE,
 )
-from .utils import _clamp_unit_float, strfdelta
+from .utils import _clamp_float, _clamp_int, _clamp_unit_float, strfdelta
 from .settings import load_settings, save_settings, is_chatterbox_model
 from .nlp import get_nlp, lang_code_from_voice, set_espeak_library
 from .gemini import (
@@ -42,6 +46,11 @@ from .audio import create_index_file, create_m4b, delete_wav_files
 
 # _m4b_progress_reporter removed: progress is now driven by real-time parsing
 # of ffmpeg's stderr inside create_m4b, using the actual speed=Nx value.
+
+
+def _cache_tag_num(value):
+    """Encode a numeric style/sampling knob into a filename tag ('.' -> 'p')."""
+    return str(value).replace('.', 'p').replace('-', 'm')
 
 
 def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
@@ -140,6 +149,23 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
     chatterbox_cfg_weight = _clamp_unit_float(
         settings.get('chatterbox_cfg_weight', CHATTERBOX_DEFAULT_CFG_WEIGHT),
         CHATTERBOX_DEFAULT_CFG_WEIGHT)
+    # Turbo ignores those two, so it gets its own sampling knobs instead. Each
+    # model keeps its own values in the config, so switching models back and
+    # forth never loses a tuning choice.
+    chatterbox_turbo_temperature = _clamp_float(
+        settings.get('chatterbox_turbo_temperature', CHATTERBOX_TURBO_DEFAULT_TEMPERATURE),
+        *CHATTERBOX_TURBO_TEMPERATURE_RANGE, CHATTERBOX_TURBO_DEFAULT_TEMPERATURE)
+    chatterbox_turbo_top_p = _clamp_float(
+        settings.get('chatterbox_turbo_top_p', CHATTERBOX_TURBO_DEFAULT_TOP_P),
+        *CHATTERBOX_TURBO_TOP_P_RANGE, CHATTERBOX_TURBO_DEFAULT_TOP_P)
+    chatterbox_turbo_top_k = _clamp_int(
+        settings.get('chatterbox_turbo_top_k', CHATTERBOX_TURBO_DEFAULT_TOP_K),
+        *CHATTERBOX_TURBO_TOP_K_RANGE, CHATTERBOX_TURBO_DEFAULT_TOP_K)
+    chatterbox_turbo_repetition_penalty = _clamp_float(
+        settings.get('chatterbox_turbo_repetition_penalty',
+                     CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY),
+        *CHATTERBOX_TURBO_REPETITION_PENALTY_RANGE,
+        CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY)
     chatterbox_model = settings.get('chatterbox_model', CHATTERBOX_DEFAULT_MODEL)
     if not is_chatterbox_model(chatterbox_model):
         chatterbox_model = CHATTERBOX_DEFAULT_MODEL
@@ -163,13 +189,22 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
             return
         print(f'Chatterbox clone source: {ref_audio}')
         print(f'Chatterbox model: {chatterbox_model}')
-        print(f'Chatterbox style: exaggeration={chatterbox_exaggeration} '
-              f'cfg_weight={chatterbox_cfg_weight}')
+        if chatterbox_model == CHATTERBOX_MODEL_TURBO:
+            print(f'Chatterbox sampling: temperature={chatterbox_turbo_temperature} '
+                  f'top_p={chatterbox_turbo_top_p} top_k={chatterbox_turbo_top_k} '
+                  f'repetition_penalty={chatterbox_turbo_repetition_penalty}')
+        else:
+            print(f'Chatterbox style: exaggeration={chatterbox_exaggeration} '
+                  f'cfg_weight={chatterbox_cfg_weight}')
         try:
             bridge = ChatterboxBridge(
                 device=settings.get('chatterbox_device', 'cuda'), ref_audio=ref_audio,
                 exaggeration=chatterbox_exaggeration, cfg_weight=chatterbox_cfg_weight,
-                model=chatterbox_model)
+                model=chatterbox_model,
+                turbo_temperature=chatterbox_turbo_temperature,
+                turbo_top_p=chatterbox_turbo_top_p,
+                turbo_top_k=chatterbox_turbo_top_k,
+                turbo_repetition_penalty=chatterbox_turbo_repetition_penalty)
         except Exception as e:
             print(f'\033[91mFailed to start the Chatterbox bridge: {e}\033[0m')
             if post_event:
@@ -207,11 +242,17 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
             # keeps Turbo and Multilingual audio from being reused interchangeably.
             if tts_engine == 'chatterbox':
                 if chatterbox_model == CHATTERBOX_MODEL_TURBO:
-                    engine_tag = '_chatterbox_turbo'
+                    # Turbo's tag names the sampling knobs instead of the style
+                    # knobs V3 uses, so changing any of them re-synthesizes.
+                    engine_tag = ('_chatterbox_turbo'
+                                  f'_t{_cache_tag_num(chatterbox_turbo_temperature)}'
+                                  f'_p{_cache_tag_num(chatterbox_turbo_top_p)}'
+                                  f'_k{chatterbox_turbo_top_k}'
+                                  f'_rp{_cache_tag_num(chatterbox_turbo_repetition_penalty)}')
                 else:
                     engine_tag = ('_chatterbox'
-                                  f'_ex{str(chatterbox_exaggeration).replace(".", "p")}'
-                                  f'_cfg{str(chatterbox_cfg_weight).replace(".", "p")}')
+                                  f'_ex{_cache_tag_num(chatterbox_exaggeration)}'
+                                  f'_cfg{_cache_tag_num(chatterbox_cfg_weight)}')
                 speed_tag = ''
             else:
                 engine_tag = ''
@@ -244,6 +285,7 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                     chapter_index=chapter.chapter_index,
                     chapter_total=len(selected_chapters),
                     tts_engine=tts_engine,
+                    chatterbox_model=chatterbox_model,
                 )
                 if stop_event and stop_event.is_set():
                     print('Synthesis stopped by user during AI rewrite.')
@@ -333,4 +375,8 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
         chatterbox_exaggeration=chatterbox_exaggeration,
         chatterbox_cfg_weight=chatterbox_cfg_weight,
         chatterbox_model=chatterbox_model,
+        chatterbox_turbo_temperature=chatterbox_turbo_temperature,
+        chatterbox_turbo_top_p=chatterbox_turbo_top_p,
+        chatterbox_turbo_top_k=chatterbox_turbo_top_k,
+        chatterbox_turbo_repetition_penalty=chatterbox_turbo_repetition_penalty,
     )

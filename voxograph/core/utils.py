@@ -13,6 +13,18 @@ def _clamp_unit_float(value, default):
         return min(1.0, max(0.0, float(value)))
     except (TypeError, ValueError):
         return float(default)
+def _clamp_float(value, low, high, default):
+    """Coerce `value` to a float within [low, high], falling back to `default`."""
+    try:
+        return min(float(high), max(float(low), float(value)))
+    except (TypeError, ValueError):
+        return float(default)
+def _clamp_int(value, low, high, default):
+    """Coerce `value` to an int within [low, high], falling back to `default`."""
+    try:
+        return min(int(high), max(int(low), int(round(float(value)))))
+    except (TypeError, ValueError):
+        return int(default)
 def _apply_fade(audio, fade_ms=5.0):
     """Apply a short fade-in/out so segment boundaries never click."""
     fade_samples = min(int(sample_rate * fade_ms / 1000.0), len(audio) // 4)

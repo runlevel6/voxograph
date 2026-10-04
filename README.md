@@ -2,8 +2,9 @@
 
 > This repository is an enhanced, feature-rich fork of [santinic/audiblez](https://github.com/santinic/audiblez).
 
-Voxograph generates `.m4b` audiobooks from regular `.epub` e-books,
-using Kokoro's high-quality speech synthesis.
+Voxograph generates `.m4b` audiobooks from regular `.epub` e-books using two interchangeable
+engines: **Kokoro-82M** and **[Chatterbox](https://github.com/resemble-ai/chatterbox)** (voice
+cloning, in Multilingual V3 and Turbo variants).
 
 [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) is a recently published text-to-speech model with just 82M params and very natural sounding output.
 It's released under Apache licence and it was trained on < 100 hours of audio.
@@ -24,11 +25,13 @@ While it has been extensively refactored with enhanced text sanitization, custom
 
 This fork adds significant architectural improvements over the original project:
 
-- **Second TTS engine: Chatterbox Multilingual V3 (voice cloning)** — the GUI can synthesize the whole book with [Chatterbox](https://github.com/resemble-ai/chatterbox) instead of Kokoro. Because Chatterbox degrades on long inputs, chapters are split into ~300-character chunks at sentence (then clause, then word) boundaries and stitched back together, and the model is loaded **once per run** through a persistent bridge process, so the multi-second load is paid a single time instead of once per chapter. See [Second TTS engine: Chatterbox](#second-tts-engine-chatterbox).
+- **Second TTS engine: Chatterbox (voice cloning)** — the GUI can synthesize the whole book with [Chatterbox](https://github.com/resemble-ai/chatterbox) instead of Kokoro, choosing between the **Multilingual V3** and **Turbo** models. Because Chatterbox degrades on long inputs, chapters are split into ~300-character chunks at sentence (then clause, then word) boundaries and stitched back together, and the model is loaded **once per run** through a persistent bridge process, so the multi-second load is paid a single time instead of once per chapter. See [Second TTS engine: Chatterbox](#second-tts-engine-chatterbox).
+
+- **Chatterbox Turbo with native paralinguistic tags** — the **Model** dropdown also offers **Turbo** (350M, faster, English-only). It ignores Exaggeration/CFG Weight and is shaped instead by its own sampling knobs — **Temperature**, **Top P**, **Top K**, **Repetition Penalty** — and its tokenizer understands 19 expressive tags (`[laugh]`, `[sigh]`, `[whispering]`, `[dramatic]`, …). When AI rewriting is enabled, the same Gemini pass that fixes pronunciation also inserts those tags where a real speaker would react. Each model keeps its own settings in `config.json`, so switching back and forth never loses a tuning choice.
 
 - **Named Chatterbox voices via a Kokoro-rendered sample library** — Chatterbox has no named voice list, so voxograph renders every Kokoro voice once into `~/.voxograph/voice_samples/<voice>.wav` (edge silence trimmed, peak normalized) and hands it to Chatterbox as the cloning prompt. The preset name is therefore the Kokoro voice name, and one dropdown serves both engines. **Build Sample** renders the selected voice in the background, **Build All** renders every voice in the dropdown, or switch the source to **Custom WAV** to clone a recording of your own. The same library is available headlessly via `python -m voxograph.voice_samples_cli --list | --voice af_heart | --all`.
 
-- **AI-Assisted Pronunciation Correction (Gemini)** — the flagship feature of this release. When **AI Phonetic Check** is enabled, each chapter is rewritten by Google Gemini *before* synthesis so Kokoro pronounces tricky words correctly. The model expands abbreviations (`Dr.` → `Doctor`, `NASA` → `N A S A`), spells out numbers and dates (`2024` → `twenty twenty four`, `3rd` → `third`), re-spells homophones and silent letters, and **always** rewrites foreign proper nouns — personal names, place names, military units — into an English-friendly spelling or an inline IPA override with stress marks (e.g. `Péronne` → `Peyron`). Plain English respelling is preferred when it is simpler and just as accurate; punctuation is preserved because it shapes prosody.
+- **AI-Assisted Pronunciation Correction (Gemini)** — the flagship feature of this release. When **AI Phonetic Check** is enabled, each chapter is rewritten by Google Gemini *before* synthesis so Kokoro pronounces tricky words correctly. The model expands abbreviations (`Dr.` → `Doctor`, `NASA` → `N A S A`), spells out numbers and dates (`2024` → `twenty twenty four`, `3rd` → `third`), re-spells homophones and silent letters, and **always** rewrites foreign proper nouns — personal names, place names, military units — into an English-friendly spelling or an inline IPA override with stress marks (e.g. `Péronne` → `Peyron`). Plain English respelling is preferred when it is simpler and just as accurate; punctuation is preserved because it shapes prosody. The rewrite rules are engine-aware: Kokoro may receive inline IPA overrides, stress marks and `[[espeak]]` phonemes, while Chatterbox gets plain-English respelling only (it cannot read IPA). When **Turbo** is selected, the same pass also inserts the model's 19 expressive tags.
 
 - **Full-pipeline, chunked AI rewriting** — the AI step runs on the *entire book* during synthesis, not just on a preview snippet. Chapters that already have a WAV file on disk are skipped without any API call, and very long chapters are rewritten in chunks of roughly 300K tokens each, with live per-chunk progress shown in the GUI.
 
@@ -36,7 +39,7 @@ This fork adds significant architectural improvements over the original project:
 
 - **"Check with AI" analysis + corrected preview** — a GUI button analyzes the selected chapter and lists each flagged word with the reason and its IPA transcription, followed by the exact rewritten text that will be sent to the TTS engine (the analysis and the rewrite share the same phonetic rules, so they can never disagree). The **Preview** button runs the same silent correction on its snippet, so the sample you hear matches the final book.
 
-- **Settings Persistence via `config.json`** — voice, speed, and output folder are saved and loaded automatically via `load_settings()` / `save_settings()` (fix #9), together with the Gemini AI settings (`gemini_enabled`, `gemini_api_key`, `gemini_model`, default model `gemini-3.1-flash-lite`). No more configuring options every launch.
+- **Settings Persistence via `config.json`** — voice, speed, and output folder are saved and loaded automatically via `load_settings()` / `save_settings()` (fix #9), together with the Gemini AI settings (`gemini_enabled`, `gemini_api_key`, `gemini_model`, default model `gemini-3.1-flash-lite`) and the Chatterbox options (`tts_engine`, `chatterbox_model`, device, voice source, reference audio, Exaggeration/CFG Weight and the Turbo sampling knobs). No more configuring options every launch.
 
 - **Cached spaCy NLP Pipeline** — spaCy is loaded once and reused across synthesis runs, eliminating the expensive model load and dramatically speeding up repeated runs (fix #4).
 
@@ -104,10 +107,24 @@ voxograph-ui
 
 ## Second TTS engine: Chatterbox
 
-Besides Kokoro, the GUI can synthesize the book with **Chatterbox Multilingual V3**, which clones
-a voice from a short reference recording. Select it in the **TTS Engine** radio of the
-*Audiobook Parameters* panel; the choice is stored in `config.json` (`tts_engine`) and is also what
-the command-line tool uses.
+Besides Kokoro, the GUI can synthesize the book with **Chatterbox**, which clones a voice from a
+short reference recording. Select it in the **TTS Engine** radio of the *Audiobook Parameters*
+panel; the choice is stored in `config.json` (`tts_engine`) and is also what the command-line tool
+uses.
+
+Chatterbox ships as a family, chosen from the **Model** dropdown (`chatterbox_model`):
+
+- **Multilingual V3** (default, 500M) — the highest-quality model. It is English-locked in this
+  configuration (23 languages are available upstream) and its delivery is shaped by
+  **Exaggeration** (expressiveness; higher also speeds pacing) and **CFG Weight** (adherence to the
+  reference clip's style/pacing).
+- **Turbo** (350M) — smaller, faster and lighter, but English-only. It ignores Exaggeration/CFG
+  Weight and is shaped instead by its sampling knobs: **Temperature**, **Top P**, **Top K** and
+  **Repetition Penalty**. Turbo also understands 19 paralinguistic tags (`[laugh]`, `[sigh]`,
+  `[whispering]`, `[dramatic]`, …), which voxograph inserts automatically when AI rewriting is on.
+
+Each model keeps its own settings in `config.json` (`chatterbox_*` vs `chatterbox_turbo_*`), so
+switching models never loses a tuning choice.
 
 Chatterbox is installed in a **separate virtualenv**, because it pins `torch==2.6.0` while voxograph
 needs a different build, and voxograph talks to it over a small bridge script:
@@ -126,12 +143,13 @@ cp chatterbox_bridge/generate.py ~/chatterbox_venv/generate.py
 
 It reads one JSON request on stdin and writes one JSON result on stdout; in `--serve` mode it loops
 over newline-delimited requests so a whole book is synthesized with a single model load. Its location
-is baked into `voxograph/core.py` (`CHATTERBOX_BRIDGE_DIR`) and can be overridden with the
-`VOXOGRAPH_CHATTERBOX_BRIDGE_DIR` environment variable.
+is baked into `voxograph/core/tts/chatterbox.py` (`CHATTERBOX_BRIDGE_DIR`) and can be overridden with
+the `VOXOGRAPH_CHATTERBOX_BRIDGE_DIR` environment variable.
 
-Note that Multilingual V3 needs a `t3_model="t3_mtl23ls_v3.safetensors"` argument on
-`ChatterboxMultilingualTTS.from_pretrained()`, which stock `chatterbox-tts==0.1.7` does not accept —
-add the parameter (and thread it through `from_local()`) in your venv.
+Two patches are needed on top of stock `chatterbox-tts==0.1.7`: Multilingual V3 needs a
+`t3_model="t3_mtl23ls_v3.safetensors"` argument on `ChatterboxMultilingualTTS.from_pretrained()`
+(thread it through `from_local()` too), and Turbo needs the `chatterbox.tts_turbo` module
+(`ChatterboxTurboTTS`), which may require a newer build.
 
 Then pick the voice to clone:
 
@@ -142,11 +160,12 @@ Then pick the voice to clone:
 
 Both engines then share the rest of the pipeline: chapter WAV caching, normalization, single-pass
 ffmpeg M4B encoding and AI phonetic correction. The AI rewrite rules are engine-aware — Kokoro gets
-inline IPA overrides, Chatterbox gets plain-English respelling only, since Chatterbox does not read
-IPA. Chapter WAVs are tagged per engine, so switching engines never reuses the other engine's audio.
+inline IPA overrides, stress marks and espeak phonemes; Chatterbox gets plain-English respelling only
+(since it does not read IPA), plus the expressive tags for Turbo. Chapter WAVs are tagged per engine
+and model, so switching engines, models or style/sampling settings never reuses stale audio.
 
-Chatterbox Multilingual V3 is English-locked in this configuration, and it is noticeably slower than
-Kokoro — expect a fraction of Kokoro's characters-per-second.
+Chatterbox is English-locked in this configuration (Multilingual V3 and Turbo alike), and it is
+noticeably slower than Kokoro — expect a fraction of Kokoro's characters-per-second.
 
 
 ## How to run on Windows

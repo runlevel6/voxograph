@@ -16,9 +16,13 @@ from pathlib import Path
 from ..constants import (
     CHATTERBOX_DEFAULT_EXAGGERATION, CHATTERBOX_DEFAULT_CFG_WEIGHT,
     CHATTERBOX_DEFAULT_MODEL, sample_rate,
+    CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, CHATTERBOX_TURBO_DEFAULT_TOP_P,
+    CHATTERBOX_TURBO_DEFAULT_TOP_K, CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY,
+    CHATTERBOX_TURBO_TEMPERATURE_RANGE, CHATTERBOX_TURBO_TOP_P_RANGE,
+    CHATTERBOX_TURBO_TOP_K_RANGE, CHATTERBOX_TURBO_REPETITION_PENALTY_RANGE,
 )
 from ..settings import is_chatterbox_model
-from ..utils import _clamp_unit_float, _apply_fade, strfdelta
+from ..utils import _clamp_float, _clamp_int, _clamp_unit_float, _apply_fade, strfdelta
 from .chunking import split_chatterbox_text
 
 
@@ -34,6 +38,40 @@ _CHATTERBOX_NOISE_MARKERS = ('it/s', '?it/s', 'Sampling:', 'Fetching', '%|')
 def _is_chatterbox_progress_noise(line):
     """True for tqdm/pipeline progress chatter that should not be echoed."""
     return any(marker in line for marker in _CHATTERBOX_NOISE_MARKERS)
+
+
+def chatterbox_bridge_request(text, output_path, device, ref_audio='',
+                              model=CHATTERBOX_DEFAULT_MODEL,
+                              language_id=CHATTERBOX_LANGUAGE_ID,
+                              t3_model=CHATTERBOX_T3_MODEL,
+                              exaggeration=CHATTERBOX_DEFAULT_EXAGGERATION,
+                              cfg_weight=CHATTERBOX_DEFAULT_CFG_WEIGHT,
+                              turbo_temperature=CHATTERBOX_TURBO_DEFAULT_TEMPERATURE,
+                              turbo_top_p=CHATTERBOX_TURBO_DEFAULT_TOP_P,
+                              turbo_top_k=CHATTERBOX_TURBO_DEFAULT_TOP_K,
+                              turbo_repetition_penalty=CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY):
+    """Build the JSON request body for the Chatterbox bridge.
+
+    Single source of truth shared by the persistent `ChatterboxBridge` and the
+    GUI's one-shot preview subprocess, so the bridge schema and the default
+    language/t3 constants can never drift between whole-book synthesis and
+    preview.
+    """
+    return {
+        'text': text,
+        'output_path': str(output_path),
+        'device': device,
+        'language_id': language_id,
+        'audio_prompt_path': ref_audio,
+        't3_model': t3_model,
+        'model': model,
+        'exaggeration': exaggeration,
+        'cfg_weight': cfg_weight,
+        'turbo_temperature': turbo_temperature,
+        'turbo_top_p': turbo_top_p,
+        'turbo_top_k': turbo_top_k,
+        'turbo_repetition_penalty': turbo_repetition_penalty,
+    }
 
 
 class ChatterboxError(RuntimeError):
@@ -55,7 +93,11 @@ class ChatterboxBridge:
                  t3_model=CHATTERBOX_T3_MODEL, python=None, script=None,
                  exaggeration=CHATTERBOX_DEFAULT_EXAGGERATION,
                  cfg_weight=CHATTERBOX_DEFAULT_CFG_WEIGHT,
-                 model=CHATTERBOX_DEFAULT_MODEL):
+                 model=CHATTERBOX_DEFAULT_MODEL,
+                 turbo_temperature=CHATTERBOX_TURBO_DEFAULT_TEMPERATURE,
+                 turbo_top_p=CHATTERBOX_TURBO_DEFAULT_TOP_P,
+                 turbo_top_k=CHATTERBOX_TURBO_DEFAULT_TOP_K,
+                 turbo_repetition_penalty=CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY):
         self.device = device
         self.ref_audio = ref_audio
         self.language_id = language_id
@@ -64,6 +106,21 @@ class ChatterboxBridge:
         self.exaggeration = _clamp_unit_float(
             exaggeration, CHATTERBOX_DEFAULT_EXAGGERATION)
         self.cfg_weight = _clamp_unit_float(cfg_weight, CHATTERBOX_DEFAULT_CFG_WEIGHT)
+        # Turbo's sampling knobs. Multilingual ignores them (it keeps its own
+        # defaults), but they travel in every payload so the bridge picks the
+        # right set per model.
+        self.turbo_temperature = _clamp_float(
+            turbo_temperature, *CHATTERBOX_TURBO_TEMPERATURE_RANGE,
+            CHATTERBOX_TURBO_DEFAULT_TEMPERATURE)
+        self.turbo_top_p = _clamp_float(
+            turbo_top_p, *CHATTERBOX_TURBO_TOP_P_RANGE,
+            CHATTERBOX_TURBO_DEFAULT_TOP_P)
+        self.turbo_top_k = _clamp_int(
+            turbo_top_k, *CHATTERBOX_TURBO_TOP_K_RANGE,
+            CHATTERBOX_TURBO_DEFAULT_TOP_K)
+        self.turbo_repetition_penalty = _clamp_float(
+            turbo_repetition_penalty, *CHATTERBOX_TURBO_REPETITION_PENALTY_RANGE,
+            CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY)
         self.python = Path(python) if python else CHATTERBOX_BRIDGE_PYTHON
         self.script = Path(script) if script else CHATTERBOX_BRIDGE_SCRIPT
         if not self.python.is_file():
@@ -109,17 +166,21 @@ class ChatterboxBridge:
 
     def generate(self, text, output_path, stop_event=None):
         """Synthesize `text` to `output_path`; return the bridge's result dict."""
-        payload = json.dumps({
-            'text': text,
-            'output_path': str(output_path),
-            'device': self.device,
-            'language_id': self.language_id,
-            'audio_prompt_path': self.ref_audio,
-            't3_model': self.t3_model,
-            'model': self.model,
-            'exaggeration': self.exaggeration,
-            'cfg_weight': self.cfg_weight,
-        })
+        payload = json.dumps(chatterbox_bridge_request(
+            text=text,
+            output_path=output_path,
+            device=self.device,
+            ref_audio=self.ref_audio,
+            model=self.model,
+            language_id=self.language_id,
+            t3_model=self.t3_model,
+            exaggeration=self.exaggeration,
+            cfg_weight=self.cfg_weight,
+            turbo_temperature=self.turbo_temperature,
+            turbo_top_p=self.turbo_top_p,
+            turbo_top_k=self.turbo_top_k,
+            turbo_repetition_penalty=self.turbo_repetition_penalty,
+        ))
         try:
             self.proc.stdin.write(payload + '\n')
             self.proc.stdin.flush()

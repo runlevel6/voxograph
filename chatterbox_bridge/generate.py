@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Chatterbox Multilingual V3 (English-locked) audio generation bridge.
+Chatterbox audio generation bridge (Multilingual V3 and Turbo).
 
 Reads a JSON request from stdin, generates a WAV, and writes JSON result
 to stdout. Designed to be invoked from another Python venv via subprocess.
@@ -34,6 +34,14 @@ from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
 
 MODEL = None
+# Which Chatterbox family member is currently loaded: 'multilingual' or 'turbo'.
+MODEL_KIND = None
+
+# Supported Chatterbox models. Both clone a voice from a reference WAV; they
+# differ in speed/size (Turbo is ~350M, English-only) and in the controls they
+# honor (Turbo has no CFG/exaggeration; it adds native paralinguistic tags like
+# [laugh] and [cough]).
+CHATTERBOX_MODELS = ('multilingual', 'turbo')
 
 
 def _to_numpy(wav):
@@ -42,12 +50,17 @@ def _to_numpy(wav):
     return np.asarray(wav).flatten().astype(np.float32)
 
 
-def _get_model(device, t3_model):
-    global MODEL
-    if MODEL is None:
-        MODEL = ChatterboxMultilingualTTS.from_pretrained(
-            device=device, t3_model=t3_model
-        )
+def _get_model(device, t3_model, model_kind):
+    global MODEL, MODEL_KIND
+    if MODEL is None or MODEL_KIND != model_kind:
+        if model_kind == 'turbo':
+            from chatterbox.tts_turbo import ChatterboxTurboTTS
+            MODEL = ChatterboxTurboTTS.from_pretrained(device=device)
+        else:
+            MODEL = ChatterboxMultilingualTTS.from_pretrained(
+                device=device, t3_model=t3_model
+            )
+        MODEL_KIND = model_kind
     return MODEL
 
 
@@ -65,12 +78,48 @@ def _generate_request(data):
     language_id = data.get("language_id", "en")
     audio_prompt_path = data.get("audio_prompt_path")
     t3_model = data.get("t3_model", "t3_mtl23ls_v3.safetensors")
+    model_kind = str(data.get("model", "multilingual")).lower()
+    if model_kind not in CHATTERBOX_MODELS:
+        model_kind = "multilingual"
+    # Chatterbox has no speed control; these two shape delivery instead.
+    # exaggeration: expressiveness/drama (higher also speeds pacing up).
+    # cfg_weight: adherence to the reference clip's style/pacing (0.3 slows
+    # and clarifies a fast reference; 0 avoids accent bleeding cross-lingually).
+    # Both are ignored by Turbo, which warns when either is non-zero, so keep
+    # them at 0.0 for Turbo.
+    exaggeration = float(data.get("exaggeration", 0.5))
+    cfg_weight = float(data.get("cfg_weight", 0.5))
+    if model_kind == "turbo":
+        exaggeration = 0.0
+        cfg_weight = 0.0
+
+    # Turbo exposes sampling knobs that Multilingual does not; defaults mirror
+    # ChatterboxTurboTTS.generate() so an absent key changes nothing.
+    temperature = max(0.0, float(data.get("turbo_temperature", 0.8)))
+    top_p = min(1.0, max(0.0, float(data.get("turbo_top_p", 0.95))))
+    top_k = max(0, int(data.get("turbo_top_k", 1000)))
+    repetition_penalty = max(0.0, float(data.get("turbo_repetition_penalty", 1.2)))
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
 
-    model = _get_model(device, t3_model)
+    model = _get_model(device, t3_model, model_kind)
 
-    kwargs = {"language_id": language_id}
+    if model_kind == "turbo":
+        # Turbo has no language_id parameter; it is English-only.
+        kwargs = {
+            "exaggeration": exaggeration,
+            "cfg_weight": cfg_weight,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
+        }
+    else:
+        kwargs = {
+            "language_id": language_id,
+            "exaggeration": exaggeration,
+            "cfg_weight": cfg_weight,
+        }
     if audio_prompt_path:
         kwargs["audio_prompt_path"] = audio_prompt_path
 
@@ -84,6 +133,13 @@ def _generate_request(data):
         "sample_rate": int(model.sr),
         "output_path": output_path,
         "device": device,
+        "model": model_kind,
+        "exaggeration": exaggeration,
+        "cfg_weight": cfg_weight,
+        "turbo_temperature": temperature,
+        "turbo_top_p": top_p,
+        "turbo_top_k": top_k,
+        "turbo_repetition_penalty": repetition_penalty,
     }
 
 

@@ -168,21 +168,67 @@ _CHATTERBOX_PHONETIC_RULES = (
     "  Example: 'Flixécourt' -> 'Flixaycoor'\n"
     "  Example: 'GUDERIAN' -> 'Guderian' (normalize casing)\n\n"
     "IMPORTANT: The Chatterbox TTS engine does NOT understand phonetic alphabets. "
-    "Do NOT output IPA symbols, stress marks, slashes, square brackets, or espeak "
-    "[[...]] syntax. Use only ordinary English letters and normal punctuation.\n\n"
+    "Do NOT output IPA symbols, stress marks, slashes, or espeak [[...]] syntax. "
+    "Use only ordinary English letters and normal punctuation — the ONLY square "
+    "brackets you may ever output are the expressive tags listed at the end of "
+    "these rules.\n\n"
     "Prosody: existing punctuation already controls intonation — "
     "; : , . ! ? — … \" ( ) \u201c \u201d all shape phrasing and pitch. "
     "Do not remove or alter punctuation; it is meaningful for Chatterbox."
 )
 
+# Chatterbox (Turbo) ships 19 expressive tokens trained natively into its
+# tokenizer vocabulary: 9 non-speech vocal effects and 10 emotion/delivery
+# styles. They are the only way to steer delivery from inside the text, so
+# when AI rewriting runs for a Chatterbox engine we ask for these tags on top
+# of the ordinary pronunciation fixes. Tags are lowercase and bracketed, and
+# they are the sole bracketed syntax allowed for Chatterbox.
+_CHATTERBOX_TAG_RULES = (
+    "CHATTERBOX EXPRESSIVE TAGS (apply IN ADDITION to the pronunciation rewrites above):\n"
+    "The selected Chatterbox model has 19 built-in special tokens that make the speech "
+    "more natural, conversational, and expressive. Use ONLY these exact lowercase, "
+    "square-bracketed tags, spelled exactly as shown:\n\n"
+    "1) Vocal Sound Effects — insert inline or mid-sentence where a real speaker would "
+    "physically react:\n"
+    "   [laugh] [chuckle] [gasp] [sigh] [groan] [sniff] [cough] [clear throat] [shush]\n\n"
+    "2) Emotion & Delivery Styles — place ONLY at the very beginning of a sentence or a "
+    "distinct line, to set the tone for the words that follow:\n"
+    "   [happy] [crying] [angry] [fear] [surprised] [whispering] [sarcastic] [dramatic] "
+    "[narration] [advertisement]\n\n"
+    "Tag instructions:\n"
+    "- Analyze the context, emotion, and punctuation, then insert a tag only where a real "
+    "human would naturally breathe, laugh, shift emotion, or react physically. Do NOT "
+    "overuse them — not every sentence needs a tag.\n"
+    "- Tags are always lowercase and enclosed in square brackets. Never translate, "
+    "capitalize, alter, or invent a tag, and never emit any other bracketed syntax.\n"
+    "- An emotion tag at the start of a line naturally bleeds into the words that follow, "
+    "until a new tag or punctuation resets the pacing.\n"
+    "- Do not change, add, or remove any of the author's words or punctuation while "
+    "adding tags; the tags are the only insertions you may make.\n"
+    "- The first tag may only be inserted where the input actually begins; never prepend "
+    "a tag before the very first word of the supplied text."
+)
 
-def _phonetic_rules_for(tts_engine):
-    """Pick the rewrite ruleset for the engine that will actually speak the text."""
-    return _CHATTERBOX_PHONETIC_RULES if tts_engine == 'chatterbox' else _PHONETIC_RULES
+
+def _phonetic_rules_for(tts_engine, chatterbox_model=None):
+    """Pick the rewrite ruleset for the engine that will actually speak the text.
+
+    Kokoro gets the phonetic rules alone (it has no tag vocabulary). Chatterbox
+    gets the plain-English respelling rules, plus the expressive-tag ruleset
+    only for the Turbo model — the 19 tags are trained into Turbo's tokenizer
+    and Multilingual V3 would read them as literal words.
+    """
+    if tts_engine != 'chatterbox':
+        return _PHONETIC_RULES
+    rules = _CHATTERBOX_PHONETIC_RULES
+    if chatterbox_model == 'turbo':
+        rules = rules + '\n\n' + _CHATTERBOX_TAG_RULES
+    return rules
 
 
 def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite',
-                                    stop_event=None, tts_engine='kokoro'):
+                                    stop_event=None, tts_engine='kokoro',
+                                    chatterbox_model=None):
     """
     Use Google Gemini AI to analyze text for potential TTS pronunciation issues
     and provide phonetic transcription guidance.
@@ -206,7 +252,7 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
     if not api_key.startswith('AIza'):
         return "Error: API key looks invalid (Gemini keys typically start with 'AIza'). Please check the value you pasted."
 
-    rules = _phonetic_rules_for(tts_engine)
+    rules = _phonetic_rules_for(tts_engine, chatterbox_model)
     engine_name = 'Chatterbox' if tts_engine == 'chatterbox' else 'Kokoro'
 
     def _do_call():
@@ -247,7 +293,8 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
     # (including chunking for long text) that main() uses before synthesis,
     # so the preview matches reality rather than just describing changes.
     rewritten_text = correct_phonetics_ai(text, api_key, model=model,
-                                          stop_event=stop_event, tts_engine=tts_engine)
+                                          stop_event=stop_event, tts_engine=tts_engine,
+                                          chatterbox_model=chatterbox_model)
 
     return (
         f"{analysis}\n\n"
@@ -299,7 +346,8 @@ def _ai_split_paragraphs(text, max_chars):
 
 def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
                          stop_event=None, post_event=None,
-                         chapter_index=None, chapter_total=None, tts_engine='kokoro'):
+                         chapter_index=None, chapter_total=None, tts_engine='kokoro',
+                         chatterbox_model=None):
     """
     Use Google Gemini AI to silently rewrite text for TTS-friendly pronunciation.
 
@@ -325,7 +373,8 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
     chunks = _ai_split_paragraphs(text, _AI_REWRITE_MAX_CHARS)
     if len(chunks) == 1:
         return _ai_rewrite_single_chunk(chunks[0], api_key, model, stop_event=stop_event,
-                                        post_event=post_event, tts_engine=tts_engine)
+                                        post_event=post_event, tts_engine=tts_engine,
+                                        chatterbox_model=chatterbox_model)
 
     rewritten = []
     for idx, chunk in enumerate(chunks, start=1):
@@ -336,7 +385,8 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
                        chapter_total=chapter_total,
                        chunk_index=idx, chunk_total=len(chunks))
         out = _ai_rewrite_single_chunk(chunk, api_key, model, stop_event=stop_event,
-                                       post_event=post_event, tts_engine=tts_engine)
+                                       post_event=post_event, tts_engine=tts_engine,
+                                       chatterbox_model=chatterbox_model)
         if out == chunk:
             rewritten.append(chunk)
         else:
@@ -344,7 +394,7 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
     return '\n\n'.join(rewritten)
 
 def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=None,
-                             tts_engine='kokoro'):
+                             tts_engine='kokoro', chatterbox_model=None):
     """Single-chunk Gemini call used by correct_phonetics_ai. Falls back to
     the original text on any failure or invalid output (after retries).
 
@@ -354,7 +404,7 @@ def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=N
     check_phonetic_transcription_ai so both prompts apply identical rules.
     """
     engine_name = 'Chatterbox' if tts_engine == 'chatterbox' else 'Kokoro'
-    rules = _phonetic_rules_for(tts_engine)
+    rules = _phonetic_rules_for(tts_engine, chatterbox_model)
 
     def _do_call():
         client = genai.Client(api_key=api_key)
@@ -371,8 +421,8 @@ def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=N
                 "foreign-language endings. List each one exactly as it appears in the text, "
                 "one per line. If there are none, write 'None found.'\n\n"
                 "STEP 2 — Rewrite the full text so the TTS engine reads it correctly. Keep "
-                "the meaning, punctuation, and sentence structure exactly the same. Apply "
-                "these rules:\n\n"
+                "the meaning, punctuation, and sentence structure exactly the same, changing "
+                "only what the rules below require. Apply these rules:\n\n"
                 f"{rules}\n\n"
                 "Every proper noun you listed in Step 1 MUST be changed in some way in the "
                 "Step 2 rewrite.\n\n"

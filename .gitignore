@@ -6,6 +6,9 @@ __pycache__/
 .venv/
 venv/
 
+# Local editor settings (machine-specific interpreter path)
+.vscode/
+
 # Secrets (contains Gemini API key / user settings)
 voxograph/config.json
 config.json
