@@ -1,6 +1,7 @@
 """voxograph.core.gemini - Gemini retry helper, phonetic rules, and AI pronunciation rewrites."""
 
 
+import re
 import time
 from google import genai
 
@@ -306,41 +307,100 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
 
 # Rough char-to-token ratio used to size Gemini requests for the
 # phonetic rewriter. ~4 chars/token is a defensible average for English
-# prose, so 300K tokens ~= 1.2M characters of payload per request.
-_AI_REWRITE_MAX_TOKENS = 300_000
+# prose, so 40K tokens ~= 160K characters of payload per request.
+_AI_REWRITE_MAX_TOKENS = 40_000
 _AI_REWRITE_CHARS_PER_TOKEN = 4
 _AI_REWRITE_MAX_CHARS = _AI_REWRITE_MAX_TOKENS * _AI_REWRITE_CHARS_PER_TOKEN
 
+# Break priority used when a stretch of text is too long for one request:
+# end of a nearby paragraph -> end of sentence (.?!) -> clause (,;:) -> word.
+_AI_PARAGRAPH_BREAK_RE = re.compile(r'\n+')
+_AI_SENTENCE_BREAK_RE = re.compile(r'(?<=[.!?])\s+')
+_AI_CLAUSE_BREAK_RE = re.compile(r'(?<=[,;:])\s+')
+
+
+def _ai_split_hard(segment, max_chars):
+    """Last resort for a segment with no usable punctuation: break at word
+    boundaries, hard-slicing a single monstrously long token if needed."""
+    out, current = [], ''
+    for word in segment.split():
+        candidate = f'{current} {word}'.strip() if current else word
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            out.append(current)
+        while len(word) > max_chars:
+            out.append(word[:max_chars])
+            word = word[max_chars:]
+        current = word
+    if current:
+        out.append(current)
+    return out
+
+
+def _ai_split_overlong(segment, max_chars, _level=0):
+    """Break one block that exceeds max_chars at the coarsest real boundary
+    available, preferring the end of a nearby paragraph: newline -> sentence
+    (.?!) -> clause (,;:) -> word -> hard split. `_level` is the next boundary
+    class to try; recursion into an over-long piece resumes one class finer so
+    a boundary is never reused on the same text."""
+    if len(segment) <= max_chars:
+        return [segment]
+
+    levels = (
+        ('\n', _AI_PARAGRAPH_BREAK_RE),
+        (' ', _AI_SENTENCE_BREAK_RE),
+        (' ', _AI_CLAUSE_BREAK_RE),
+    )
+    for level in range(_level, len(levels)):
+        sep, regex = levels[level]
+        units = [u.strip() for u in regex.split(segment) if u.strip()]
+        if len(units) <= 1:
+            continue
+        chunks, current = [], ''
+        for unit in units:
+            if len(unit) > max_chars:
+                if current:
+                    chunks.append(current)
+                    current = ''
+                chunks.extend(_ai_split_overlong(unit, max_chars, level + 1))
+                continue
+            candidate = f'{current}{sep}{unit}' if current else unit
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                current = unit
+        if current:
+            chunks.append(current)
+        return chunks
+    return _ai_split_hard(segment, max_chars)
+
 
 def _ai_split_paragraphs(text, max_chars):
-    """Split text into chunks of <= max_chars on whitespace, joining whole
-    paragraphs back together greedily. Falls back to hard word-splitting
-    when a single paragraph exceeds max_chars (rare for cleaned EPUBs)."""
+    """Split text into chunks of <= max_chars, joining whole paragraphs back
+    together greedily. A paragraph that is itself over the limit is broken at
+    the coarsest real boundary (see _ai_split_overlong) instead of being
+    sliced at an arbitrary character offset."""
     if len(text) <= max_chars:
         return [text]
     paragraphs = [p for p in text.split('\n\n') if p]
     chunks, current = [], ''
     for para in paragraphs:
-        if not current:
-            current = para
-            continue
-        if len(current) + 2 + len(para) <= max_chars:
-            current = current + '\n\n' + para
-        else:
-            chunks.append(current)
-            current = para
+        pieces = [para] if len(para) <= max_chars else _ai_split_overlong(para, max_chars)
+        for piece in pieces:
+            if not current:
+                current = piece
+                continue
+            if len(current) + 2 + len(piece) <= max_chars:
+                current = current + '\n\n' + piece
+            else:
+                chunks.append(current)
+                current = piece
     if current:
         chunks.append(current)
-
-    if any(len(c) > max_chars for c in chunks):
-        refined = []
-        for c in chunks:
-            if len(c) <= max_chars:
-                refined.append(c)
-                continue
-            for i in range(0, len(c), max_chars):
-                refined.append(c[i:i + max_chars])
-        chunks = refined
     return chunks
 
 
@@ -351,8 +411,8 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
     """
     Use Google Gemini AI to silently rewrite text for TTS-friendly pronunciation.
 
-    For long inputs the text is split into chunks of at most ~300K tokens
-    (≈ 1.2M chars) and each chunk is rewritten in its own request. The
+    For long inputs the text is split into chunks of at most ~40K tokens
+    (≈ 160K chars) and each chunk is rewritten in its own request. The
     chunks are joined with blank lines to mirror the paragraph structure
     of the input.
 
