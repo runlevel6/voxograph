@@ -248,10 +248,28 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                           f'_cfg{_cache_tag_num(chatterbox_cfg_weight)}')
         speed_tag = ''
 
+    # Chatterbox bridge retry settings
+    chatterbox_max_retries = 3
+
     def _chapter_wav_path(i, chapter):
         xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
         return Path(output_folder) / filename.replace(
             extension, f'_chapter_{i}_{voice}{engine_tag}_{speed_tag}_{xhtml_file_name}.wav')
+
+    def _recreate_chatterbox_bridge():
+        """Create a new ChatterboxBridge with the same settings."""
+        nonlocal bridge
+        if bridge is not None:
+            bridge.close()
+        bridge = ChatterboxBridge(
+            device=settings.get('chatterbox_device', 'cuda'), ref_audio=ref_audio,
+            exaggeration=chatterbox_exaggeration, cfg_weight=chatterbox_cfg_weight,
+            model=chatterbox_model,
+            turbo_temperature=chatterbox_turbo_temperature,
+            turbo_top_p=chatterbox_turbo_top_p,
+            turbo_top_k=chatterbox_turbo_top_k,
+            turbo_repetition_penalty=chatterbox_turbo_repetition_penalty)
+        print('Chatterbox bridge recreated.')
 
     # Collect the chapters that still need synthesis and must be rewritten by
     # AI first. Chapters with an existing WAV and <10-char chapters are skipped
@@ -329,14 +347,26 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                 post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
 
             if tts_engine == 'chatterbox':
-                try:
-                    audio_segments, write_sample_rate = gen_audio_segments_chatterbox(
-                        bridge, text, stats=stats, post_event=post_event,
-                        max_chunks=max_sentences, stop_event=stop_event)
-                except ChatterboxError as e:
-                    print(f'\033[91mChatterbox generation failed: {e}\033[0m')
-                    if post_event:
-                        post_event('CORE_ERROR', message=f'Chatterbox generation failed: {e}')
+                retries = 0
+                while retries <= chatterbox_max_retries:
+                    try:
+                        audio_segments, write_sample_rate = gen_audio_segments_chatterbox(
+                            bridge, text, stats=stats, post_event=post_event,
+                            max_chunks=max_sentences, stop_event=stop_event)
+                        break
+                    except ChatterboxCancelled:
+                        raise
+                    except ChatterboxError as e:
+                        retries += 1
+                        if retries > chatterbox_max_retries:
+                            print(f'\033[91mChatterbox generation failed after {chatterbox_max_retries} retries: {e}\033[0m')
+                            if post_event:
+                                post_event('CORE_ERROR', message=f'Chatterbox generation failed after {chatterbox_max_retries} retries: {e}')
+                            audio_segments = None
+                            break
+                        print(f'\033[93mChatterbox error (attempt {retries}/{chatterbox_max_retries}): {e}. Recreating bridge...\033[0m')
+                        _recreate_chatterbox_bridge()
+                if audio_segments is None:
                     break
             else:
                 audio_segments = gen_audio_segments(
