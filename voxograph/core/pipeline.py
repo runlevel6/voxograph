@@ -34,7 +34,7 @@ from .epub import (
 )
 from .tts.kokoro import gen_audio_segments
 from .tts.chatterbox import (
-    ChatterboxBridge, ChatterboxError, gen_audio_segments_chatterbox,
+    ChatterboxBridge, ChatterboxError, ChatterboxCancelled, gen_audio_segments_chatterbox,
 )
 from .voice_samples import generate_voice_sample, resolve_chatterbox_ref_audio
 from .audio import create_index_file, create_m4b, delete_wav_files
