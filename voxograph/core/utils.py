@@ -35,6 +35,22 @@ def _apply_fade(audio, fade_ms=5.0):
     audio[:fade_samples] *= ramp
     audio[-fade_samples:] *= ramp[::-1]
     return audio
+
+
+def _insert_silence_between(segments, silence_ms):
+    """Join `segments` with `silence_ms` of zeros between each pair.
+
+    A no-op when there is 0 or 1 segment, or when silence_ms <= 0.
+    """
+    if len(segments) <= 1 or silence_ms <= 0:
+        return segments
+    gap = np.zeros(int(sample_rate * silence_ms / 1000.0), dtype=np.float32)
+    out = []
+    for seg in segments:
+        if out:
+            out.append(gap)
+        out.append(seg)
+    return out
 def strfdelta(tdelta, fmt='{D:02}d {H:02}h {M:02}m {S:02}s'):
     remainder = int(tdelta)
     f = Formatter()

@@ -20,8 +20,9 @@ from .constants import (
     CHATTERBOX_TURBO_DEFAULT_TOP_K, CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY,
     CHATTERBOX_TURBO_TEMPERATURE_RANGE, CHATTERBOX_TURBO_TOP_P_RANGE,
     CHATTERBOX_TURBO_TOP_K_RANGE, CHATTERBOX_TURBO_REPETITION_PENALTY_RANGE,
+    CHUNK_SILENCE_MS,
 )
-from .utils import _clamp_float, _clamp_int, _clamp_unit_float, strfdelta
+from .utils import _clamp_float, _clamp_int, _clamp_unit_float, strfdelta, _insert_silence_between
 from .settings import load_settings, save_settings, is_chatterbox_model
 from .nlp import get_nlp, lang_code_from_voice, set_espeak_library
 from .gemini import (
@@ -375,6 +376,7 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                 write_sample_rate = sample_rate
 
             if audio_segments:
+                audio_segments = _insert_silence_between(audio_segments, CHUNK_SILENCE_MS)
                 final_audio = np.concatenate(audio_segments)
                 peak = np.abs(final_audio).max()
                 if peak > 0:

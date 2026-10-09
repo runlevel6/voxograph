@@ -32,6 +32,11 @@ import torch
 import soundfile as sf
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
+# Pin torch's intra-op thread count once, before any model is loaded.
+# Chatterbox does not benefit from torch's default (all cores) and
+# oversubscribes the CPU; 4 threads keeps generation steady.
+torch.set_num_threads(4)
+
 
 MODEL = None
 # Which Chatterbox family member is currently loaded: 'multilingual' or 'turbo'.

@@ -46,3 +46,7 @@ CHATTERBOX_MODEL_TURBO = 'turbo'
 CHATTERBOX_MODELS = (CHATTERBOX_MODEL_MULTILINGUAL, CHATTERBOX_MODEL_TURBO)
 CHATTERBOX_DEFAULT_MODEL = CHATTERBOX_MODEL_MULTILINGUAL
 DEFAULT_VOICE = 'af_heart'
+
+# Silence (ms) inserted between synthesized chunks so the join does not sound
+# like one breathless run-on sentence. 400 ms is a natural short-pause beat.
+CHUNK_SILENCE_MS = 400
