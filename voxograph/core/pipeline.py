@@ -6,6 +6,7 @@ import soundfile
 import numpy as np
 import time
 import shutil
+import threading
 from types import SimpleNamespace
 from pathlib import Path
 from kokoro import KPipeline
@@ -13,9 +14,10 @@ from ebooklib import epub
 
 from .constants import (
     sample_rate, _SPOKEN_CHARS_PER_SEC, _AAC_ENCODE_RT_FACTOR,
+    _AI_MIN_AGGREGATE_TOKENS, _AI_REWRITE_MAX_TOKENS,
     DEFAULT_VOICE, DEFAULT_VOICE_SAMPLES_DIR,
     CHATTERBOX_DEFAULT_EXAGGERATION, CHATTERBOX_DEFAULT_CFG_WEIGHT,
-    CHATTERBOX_DEFAULT_MODEL, CHATTERBOX_MODEL_TURBO,
+    CHATTERBOX_DEFAULT_MODEL, CHATTERBOX_MAX_RETRIES, CHATTERBOX_MODEL_TURBO,
     CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, CHATTERBOX_TURBO_DEFAULT_TOP_P,
     CHATTERBOX_TURBO_DEFAULT_TOP_K, CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY,
     CHATTERBOX_TURBO_TEMPERATURE_RANGE, CHATTERBOX_TURBO_TOP_P_RANGE,
@@ -27,7 +29,6 @@ from .settings import load_settings, save_settings, is_chatterbox_model
 from .nlp import get_nlp, lang_code_from_voice, set_espeak_library
 from .gemini import (
     _iter_correct_phonetics_ai_pieces, _sanitize_api_key,
-    _AI_REWRITE_MAX_TOKENS, _AI_MIN_AGGREGATE_TOKENS,
 )
 from .epub import (
     find_cover, find_document_chapters_and_extract_texts,
@@ -249,9 +250,6 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                           f'_cfg{_cache_tag_num(chatterbox_cfg_weight)}')
         speed_tag = ''
 
-    # Chatterbox bridge retry settings
-    chatterbox_max_retries = 3
-
     def _chapter_wav_path(i, chapter):
         xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
         return Path(output_folder) / filename.replace(
@@ -309,35 +307,42 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
     # request is pulled from the generator (see the advance at the loop tail).
     next_ai = next(ai_pieces, None)
 
-    def _synthesize(piece_text):
+    def _synthesize(piece_text, on_halfway=None):
         """Synthesize one piece of text, returning (segments, sample_rate).
 
         For Chatterbox, a bridge crash is retried by recreating the bridge;
         returns (None, None) once every retry is exhausted (after posting
         CORE_ERROR) so the caller can stop the run.
+
+        `on_halfway` is invoked (once) when the piece is ~50% spoken, so the
+        caller can start the next Gemini rewrite in the background while the
+        rest of this piece's TTS finishes — synthesis and the next AI request
+        then overlap instead of being strictly serialized.
         """
         if tts_engine == 'chatterbox':
             retries = 0
-            while retries <= chatterbox_max_retries:
+            while retries <= CHATTERBOX_MAX_RETRIES:
                 try:
                     return gen_audio_segments_chatterbox(
                         bridge, piece_text, stats=stats, post_event=post_event,
-                        max_chunks=max_sentences, stop_event=stop_event)
+                        max_chunks=max_sentences, stop_event=stop_event,
+                        on_halfway=on_halfway)
                 except ChatterboxCancelled:
                     raise
                 except ChatterboxError as e:
                     retries += 1
-                    if retries > chatterbox_max_retries:
-                        print(f'\033[91mChatterbox generation failed after {chatterbox_max_retries} retries: {e}\033[0m')
+                    if retries > CHATTERBOX_MAX_RETRIES:
+                        print(f'\033[91mChatterbox generation failed after {CHATTERBOX_MAX_RETRIES} retries: {e}\033[0m')
                         if post_event:
-                            post_event('CORE_ERROR', message=f'Chatterbox generation failed after {chatterbox_max_retries} retries: {e}')
+                            post_event('CORE_ERROR', message=f'Chatterbox generation failed after {CHATTERBOX_MAX_RETRIES} retries: {e}')
                         return None, None
-                    print(f'\033[93mChatterbox error (attempt {retries}/{chatterbox_max_retries}): {e}. Recreating bridge...\033[0m')
+                    print(f'\033[93mChatterbox error (attempt {retries}/{CHATTERBOX_MAX_RETRIES}): {e}. Recreating bridge...\033[0m')
                     _recreate_chatterbox_bridge()
             return None, None
         segments = gen_audio_segments(
             pipeline, piece_text, voice, speed, stats,
-            post_event=post_event, max_sentences=max_sentences, stop_event=stop_event)
+            post_event=post_event, max_sentences=max_sentences, stop_event=stop_event,
+            on_halfway=on_halfway)
         return segments, sample_rate
 
     chapter_wav_files = []
@@ -373,11 +378,40 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
             audio_segments = []
             write_sample_rate = sample_rate
             if next_ai is not None and next_ai[0] == chapter.chapter_index:
-                # AI chapter: synthesize fragment by fragment. Pulling the next
-                # piece after a fragment has been spoken triggers the next
-                # Gemini request, so AI and TTS interleave even inside one long
-                # chapter instead of blocking on the whole chapter's rewrite.
+                # AI chapter: synthesize fragment by fragment. The next Gemini
+                # request is started in a background thread once the current
+                # fragment is ~50% spoken (see _on_halfway below), so the rest
+                # of this fragment's TTS and the next AI rewrite run in
+                # PARALLEL — AI -> TTS -> AI -> TTS with the two overlapping —
+                # instead of being strictly serialized (TTS fully finishes,
+                # THEN the next request is sent).
                 first_piece = True
+                # Slot for the piece fetched in the background while the
+                # current one is still being spoken. None == not started or
+                # not ready yet; a tuple is a ready piece.
+                fetch_state = {'piece': None, 'thread': None}
+
+                def _start_fetch():
+                    def _worker():
+                        try:
+                            fetch_state['piece'] = next(ai_pieces, None)
+                        except StopIteration:
+                            fetch_state['piece'] = None
+                        except Exception as e:
+                            print(f'\033[91mBackground Gemini fetch failed: {e}\033[0m')
+                            fetch_state['piece'] = None
+                    t = threading.Thread(target=_worker, daemon=True)
+                    fetch_state['thread'] = t
+                    t.start()
+
+                def _on_halfway():
+                    # Kick off the next Gemini request now, while the rest of
+                    # this piece keeps being spoken. Guard against a fetch
+                    # already in flight (short pieces may cross 50% more than
+                    # once if the callback is invoked per-sentence).
+                    if fetch_state['thread'] is None:
+                        _start_fetch()
+
                 while next_ai is not None and next_ai[0] == chapter.chapter_index:
                     if stop_event and stop_event.is_set():
                         print('Synthesis stopped by user during AI rewrite.')
@@ -385,7 +419,7 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                     piece_text = next_ai[1]
                     if i == 1 and first_piece:
                         piece_text = f'{title} – {creator}.\n\n' + piece_text
-                    segments, piece_sr = _synthesize(piece_text)
+                    segments, piece_sr = _synthesize(piece_text, on_halfway=_on_halfway)
                     if segments is None:
                         audio_segments = None
                         break
@@ -398,7 +432,15 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                         print('Synthesis stopped by user during AI rewrite.')
                         audio_segments = None
                         break
-                    next_ai = next(ai_pieces, None)
+                    # The next piece may already be fetched in the background
+                    # (started when this piece crossed 50%); otherwise pull it
+                    # synchronously — this is what keeps the loop moving for
+                    # pieces so short they finish before the halfway point.
+                    if fetch_state['thread'] is not None:
+                        fetch_state['thread'].join()
+                    next_ai = fetch_state['piece']
+                    fetch_state['piece'] = None
+                    fetch_state['thread'] = None
                     if is_last:
                         break
                 if audio_segments is None:

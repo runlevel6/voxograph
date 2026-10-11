@@ -2,17 +2,21 @@
 
 
 import math
-import re
 import threading
 import time
 from google import genai
 from google.genai import types
 
-
-# Explicitly request the largest output budget Gemini accepts, overriding the
-# SDK/model default, so long phonetic rewrites are never silently truncated.
-# Applied as GenerateContentConfig(max_output_tokens=...) on every API call.
-_AI_MAX_OUTPUT_TOKENS = 65536
+from .constants import (
+    GEMINI_MODELS,
+    _AI_CLAUSE_BREAK_RE, _AI_MAX_OUTPUT_TOKENS, _AI_MIN_AGGREGATE_CHARS,
+    _AI_MIN_AGGREGATE_TOKENS, _AI_MIN_PREFIX_CHARS, _AI_PARAGRAPH_BREAK_RE,
+    _AI_PART_JOIN, _AI_PART_MARKER, _AI_REWRITE_CHARS_PER_TOKEN,
+    _AI_REWRITE_MAX_CHARS, _AI_REWRITE_MAX_TOKENS, _AI_SENTENCE_BREAK_RE,
+    _CHATTERBOX_PHONETIC_RULES, _CHATTERBOX_TAG_RULES,
+    _GEMINI_REQUEST_TIMEOUT_MS, _GEMINI_REQUEST_TIMEOUT_SECS, _GEMINI_RETRY_DELAYS_SECS,
+    _NON_RETRYABLE_ERROR_MARKERS, _PHONETIC_RULES,
+)
 
 
 def _ai_generate_config():
@@ -44,48 +48,12 @@ def _ai_generate_config():
 # Gemini retry helper
 # ---------------------------------------------------------------------------
 
-# Backoff schedule requested: retry after 1 minute, then 2, then 3, then 4
-# (each pause is the previous pause + 1 minute). That's 4 retries (5 total
-# attempts) before giving up.
-_GEMINI_RETRY_DELAYS_SECS = [60, 120, 180, 240]
-
-# Errors in this set are permanent (bad model name, bad key, no permission)
-# and will never succeed no matter how many times we retry, so we bail out
-# immediately instead of making the caller wait up to 10 minutes for nothing.
-_NON_RETRYABLE_ERROR_MARKERS = ('NOT_FOUND', 'PERMISSION_DENIED', 'INVALID_ARGUMENT', 'UNAUTHENTICATED')
-
-# Hard ceiling on a single Gemini request. A watchdog thread prints a live
-# countdown while the call is in flight; if no response arrives in this window
-# the model is abandoned and the next one is tried. The SDK client is also
-# built with the same HTTP timeout (HttpOptions.timeout is in milliseconds)
-# so the hung request is actually aborted on the client side rather than
-# lingering until the OS-level TCP timeout.
-_GEMINI_REQUEST_TIMEOUT_SECS = 60
-_GEMINI_REQUEST_TIMEOUT_MS = _GEMINI_REQUEST_TIMEOUT_SECS * 1000
-
 
 class GeminiTimeoutError(RuntimeError):
     """No response from a Gemini model within _GEMINI_REQUEST_TIMEOUT_SECS.
 
     The message carries no non-retryable marker, so the model-fallback loop
     treats it as transient and moves straight on to the next model."""
-
-
-# Ordered list of Gemini models to try sequentially until one succeeds.
-# Newer models first; the first available/working model will be used.
-GEMINI_MODELS = (
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-3-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-)
 
 
 def _gemini_client(api_key):
@@ -161,9 +129,10 @@ def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
     Try calling func(model, *args, **kwargs) with each model in GEMINI_MODELS
     until one succeeds. func must accept `model` as its first argument.
 
-    Each model is tried once, immediately: a busy/unavailable model (retryable
-    error) moves straight to the next model instead of waiting out the backoff
-    schedule on the same one. A model that produces no response within
+    Each model is tried once; a busy/unavailable model (retryable error, e.g.
+    503) waits 1 minute and retries the SAME model once before moving on — a
+    demand spike is usually temporary and the first model is often still the
+    best bet. A model that produces no response within
     _GEMINI_REQUEST_TIMEOUT_SECS (60s) is abandoned and the next model is
     tried. Only when EVERY model fails in a pass does the whole list wait a
     backoff delay and get retried (1, 2, 3, then 4 minutes); after the last
@@ -201,8 +170,32 @@ def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
                     print(f'\033[91m[Gemini] Model {model} failed with non-retryable error: {e}\033[0m')
                     print('\033[91m[Gemini] Stopping model fallback (error likely not model-specific)\033[0m')
                     raise
-                # Busy/unavailable: try the next model right away.
-                print(f'\033[93m[Gemini] Model {model} failed: {e}. Trying next model...\033[0m')
+                # Busy/unavailable (e.g. 503): wait 1 minute and retry the
+                # SAME model once — a demand spike is usually temporary and
+                # the first model is often still the best bet. If the retry
+                # also fails, move on to the next model.
+                print(f'\033[93m[Gemini] Model {model} failed: {e}. Waiting 1 '
+                      f'minute before retrying {model}...\033[0m')
+                _sleep_with_stop_event(60, stop_event)
+                if stop_event and stop_event.is_set():
+                    if last_exc:
+                        raise last_exc
+                    raise RuntimeError('Stopped by user.')
+                print(f'\033[96m[Gemini] Retrying model {i+1}/{len(GEMINI_MODELS)}: '
+                      f'{model}\033[0m')
+                try:
+                    return _call_gemini_with_timeout(func, model, *args,
+                                                     stop_event=stop_event, label=model, **kwargs)
+                except Exception as retry_exc:
+                    last_exc = retry_exc
+                    if not _is_retryable_gemini_error(retry_exc):
+                        print(f'\033[91m[Gemini] Model {model} retry failed with '
+                              f'non-retryable error: {retry_exc}\033[0m')
+                        print('\033[91m[Gemini] Stopping model fallback '
+                              '(error likely not model-specific)\033[0m')
+                        raise
+                    print(f'\033[93m[Gemini] Model {model} retry also failed: '
+                          f'{retry_exc}. Trying next model...\033[0m')
         if round_index < len(_GEMINI_RETRY_DELAYS_SECS):
             delay = _GEMINI_RETRY_DELAYS_SECS[round_index]
             print(f'\033[93m[Gemini] All {len(GEMINI_MODELS)} models failed. Waiting '
@@ -279,116 +272,6 @@ def _sanitize_api_key(api_key):
     if cleaned != api_key or any(c.isspace() for c in api_key):
         cleaned = ' '.join(cleaned.split())
     return cleaned
-
-
-
-# ---------------------------------------------------------------------------
-# Shared phonetic rewrite rules — single source of truth used by BOTH the
-# silent rewrite path (_ai_rewrite_single_chunk) and the human-readable
-# analysis path (check_phonetic_transcription_ai), so the two can never
-# describe/apply different rules for what counts as "needs fixing".
-#
-# Note: espeak-ng's [[...]] phoneme-override syntax is intentionally NOT
-# offered here. That syntax expects espeak's own Kirshenbaum-based ASCII
-# mnemonics (e.g. "w3:ld"), not standard Unicode IPA — Gemini reliably
-# produces the latter but not the former, so asking it to emit [[...]]
-# phonemes silently produces garbled/unrecognized input to espeak-ng.
-# Kokoro's own inline IPA override (plain Unicode IPA, no brackets) is the
-# only phonetic-override path offered, since Gemini can produce valid IPA.
-# ---------------------------------------------------------------------------
-_PHONETIC_RULES = (
-    "Only flag/change words or formatting that affect pronunciation, such as:\n"
-    "- Expand abbreviations (Dr. -> Doctor, St. -> Saint only when it is a name, "
-    "  NASA -> N A S A, FBI -> F B I, etc.)\n"
-    "- Spell out numbers and dates in words (2024 -> twenty twenty four, 3rd -> third)\n"
-    "- Fix homophones, silent letters, or unusual stress by re-spelling the word\n\n"
-    "FOREIGN PROPER NOUNS (mandatory, not optional):\n"
-    "Any proper noun using non-English orthography or spelling conventions — accented "
-    "letters (é, è, ç, œ, ü, etc.), unusual consonant clusters, silent letters, or "
-    "foreign name endings — MUST be rewritten in some form. This applies to place names, "
-    "personal names, military unit names, and any other proper noun. Do not leave a "
-    "French, German, or other foreign-language name unchanged, even if you are uncertain "
-    "of the exact native pronunciation — an approximate English rendering is always better "
-    "than leaving the raw spelling for the default G2P to butcher.\n"
-    "  Example: 'Amiens' -> 'Amyen' or ˈɑːmiˌæn\n"
-    "  Example: 'Péronne' -> 'Peyron' or peɪˈrɒn\n"
-    "  Example: 'Flixécourt' -> 'Flixaycoor'\n"
-    "  Example: 'GUDERIAN' -> 'Guderian' (normalize casing)\n\n"
-    "You MAY use the Kokoro inline phonetic override: replace a word directly with its "
-    "standard Unicode IPA phonetic spelling (no brackets needed), using stress marks ˈ "
-    "(primary) and ˌ (secondary). Example: Kokoro or Paris rewritten as kˈOkəɹO or ˈpæɹɪs. "
-    "Do not use espeak-style double-bracket phoneme syntax (e.g. [[...]]) — it is not "
-    "supported here and will not be pronounced correctly.\n\n"
-    "Prosody: existing punctuation already controls intonation — "
-    "; : , . ! ? — … \" ( ) \u201c \u201d all shape phrasing and pitch. "
-    "Do not remove or alter punctuation; it is meaningful for Kokoro.\n\n"
-    "- Prefer the simplest fix: only use inline IPA replacements for words that "
-    "  the default G2P would misread (names, loanwords, acronyms). Plain English "
-    "  respelling is preferred when it's simpler and equally accurate."
-)
-
-# Chatterbox has no inline phonetic-override syntax: IPA symbols, stress marks
-# and [[...]] would be read literally (or dropped). Chatterbox rewrites must
-# therefore use ordinary English letter respelling only.
-_CHATTERBOX_PHONETIC_RULES = (
-    "Only flag/change words or formatting that affect pronunciation, such as:\n"
-    "- Expand abbreviations (Dr. -> Doctor, St. -> Saint only when it is a name, "
-    "  NASA -> N A S A, FBI -> F B I, etc.)\n"
-    "- Spell out numbers and dates in words (2024 -> twenty twenty four, 3rd -> third)\n"
-    "- Respell words with unusual pronunciation using ordinary English letters\n\n"
-    "FOREIGN PROPER NOUNS (mandatory, not optional):\n"
-    "Any proper noun using non-English orthography or spelling conventions — accented "
-    "letters (é, è, ç, œ, ü, etc.), unusual consonant clusters, silent letters, or "
-    "foreign name endings — MUST be rewritten using ordinary English letters. This applies "
-    "to place names, personal names, military unit names, and any other proper noun. Do not "
-    "leave a French, German, or other foreign-language name unchanged, even if you are "
-    "uncertain of the exact native pronunciation — an approximate English rendering is "
-    "always better than leaving the raw spelling for the default G2P to butcher.\n"
-    "  Example: 'Amiens' -> 'Amyen'\n"
-    "  Example: 'Péronne' -> 'Peyron'\n"
-    "  Example: 'Flixécourt' -> 'Flixaycoor'\n"
-    "  Example: 'GUDERIAN' -> 'Guderian' (normalize casing)\n\n"
-    "IMPORTANT: The Chatterbox TTS engine does NOT understand phonetic alphabets. "
-    "Do NOT output IPA symbols, stress marks, slashes, or espeak [[...]] syntax. "
-    "Use only ordinary English letters and normal punctuation — the ONLY square "
-    "brackets you may ever output are the expressive tags listed at the end of "
-    "these rules.\n\n"
-    "Prosody: existing punctuation already controls intonation — "
-    "; : , . ! ? — … \" ( ) \u201c \u201d all shape phrasing and pitch. "
-    "Do not remove or alter punctuation; it is meaningful for Chatterbox."
-)
-
-# Chatterbox (Turbo) ships 19 expressive tokens trained natively into its
-# tokenizer vocabulary: 9 non-speech vocal effects and 10 emotion/delivery
-# styles. They are the only way to steer delivery from inside the text, so
-# when AI rewriting runs for a Chatterbox engine we ask for these tags on top
-# of the ordinary pronunciation fixes. Tags are lowercase and bracketed, and
-# they are the sole bracketed syntax allowed for Chatterbox.
-_CHATTERBOX_TAG_RULES = (
-    "CHATTERBOX EXPRESSIVE TAGS (apply IN ADDITION to the pronunciation rewrites above):\n"
-    "The selected Chatterbox model has 19 built-in special tokens that make the speech "
-    "more natural, conversational, and expressive. Use ONLY these exact lowercase, "
-    "square-bracketed tags, spelled exactly as shown:\n\n"
-    "1) Vocal Sound Effects — insert inline or mid-sentence where a real speaker would "
-    "physically react:\n"
-    "   [laugh] [chuckle] [gasp] [sigh] [groan] [sniff] [cough] [clear throat] [shush]\n\n"
-    "2) Emotion & Delivery Styles — place ONLY at the very beginning of a sentence or a "
-    "distinct line, to set the tone for the words that follow:\n"
-    "   [happy] [crying] [angry] [fear] [surprised] [whispering] [sarcastic] [dramatic] "
-    "[narration] [advertisement]\n\n"
-    "Tag instructions:\n"
-    "- Analyze the context, emotion, and punctuation, then insert a tag only where a real "
-    "human would naturally breathe, laugh, shift emotion, or react physically. Do NOT "
-    "overuse them — not every sentence needs a tag.\n"
-    "- Tags are always lowercase and enclosed in square brackets. Never translate, "
-    "capitalize, alter, or invent a tag, and never emit any other bracketed syntax.\n"
-    "- An emotion tag at the start of a line naturally bleeds into the words that follow, "
-    "until a new tag or punctuation resets the pacing.\n"
-    "- Do not change, add, or remove any of the author's words or punctuation while "
-    "adding tags; the tags are the only insertions you may make.\n"
-    "- The first tag may only be inserted where the input actually begins; never prepend "
-    "a tag before the very first word of the supplied text."
-)
 
 
 def _phonetic_rules_for(tts_engine, chatterbox_model=None):
@@ -492,37 +375,6 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
         f"{'=' * 60}\n\n"
         f"{rewritten_text}"
     )
-
-# Rough char-to-token ratio used to size Gemini requests for the
-# phonetic rewriter. ~4 chars/token is a defensible average for English
-# prose, so 8K tokens ~= 32K characters of payload per request.
-_AI_REWRITE_MAX_TOKENS = 8_000
-_AI_REWRITE_CHARS_PER_TOKEN = 4
-_AI_REWRITE_MAX_CHARS = _AI_REWRITE_MAX_TOKENS * _AI_REWRITE_CHARS_PER_TOKEN
-
-# Break priority used when a stretch of text is too long for one request:
-# end of a nearby paragraph -> end of sentence (.?!) -> clause (,;:) -> word.
-_AI_PARAGRAPH_BREAK_RE = re.compile(r'\n+')
-_AI_SENTENCE_BREAK_RE = re.compile(r'(?<=[.!?])\s+')
-_AI_CLAUSE_BREAK_RE = re.compile(r'(?<=[,;:])\s+')
-
-# A chapter below this size (in rough tokens) is never sent to Gemini as its
-# own request: it is merged with the leading part of the next chapter so a
-# request is never a tiny, context-poor snippet.
-_AI_MIN_AGGREGATE_TOKENS = 1_000
-_AI_MIN_AGGREGATE_CHARS = _AI_MIN_AGGREGATE_TOKENS * _AI_REWRITE_CHARS_PER_TOKEN
-
-# Marker used to join several chapters into one request. The model is asked to
-# preserve it verbatim; the response is split back on it, and if it is not
-# preserved the unit falls back to one request per piece. The token itself is
-# bracketed with newlines when joining, but only the bare token is searched for
-# on the way back, so a dropped blank line still splits correctly.
-_AI_PART_MARKER = '<VX_PART_BREAK>'
-_AI_PART_JOIN = '\n\n' + _AI_PART_MARKER + '\n\n'
-
-# Below this many characters of slack it is not worth splitting the next
-# chapter just to top up a small unit; close the unit as-is instead.
-_AI_MIN_PREFIX_CHARS = 200
 
 
 def _ai_split_hard(segment, max_chars):

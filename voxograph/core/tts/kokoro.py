@@ -11,11 +11,26 @@ from ..nlp import get_nlp, lang_code_from_voice
 from ..utils import _apply_fade, strfdelta
 
 
-def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=None, post_event=None, stop_event=None):
+def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=None, post_event=None, stop_event=None, on_halfway=None):
     nlp = get_nlp()  # fix #4: use cached instance
     audio_segments = []
     doc = nlp(text)
     sentences = list(doc.sents)
+    # Per-piece character tracking, so on_halfway can fire once the current
+    # piece is ~50% spoken (by characters, which tracks audio duration far
+    # better than a raw sentence count would). The global stats counter is
+    # updated below exactly as before.
+    piece_total = sum(len(sent.text) for sent in sentences) or 1
+    piece_done = 0
+    halfway_fired = False
+
+    def _maybe_halfway():
+        nonlocal halfway_fired
+        if not halfway_fired and piece_done >= piece_total / 2:
+            halfway_fired = True
+            if on_halfway is not None:
+                on_halfway()
+
     for i, sent in enumerate(sentences):
         if stop_event and stop_event.is_set():
             print('Synthesis stopped by user.')
@@ -32,6 +47,8 @@ def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=N
             # prevent clicks caused by DC-offset discontinuities at
             # sentence boundaries.
             audio_segments.append(_apply_fade(np.asarray(audio)))
+        piece_done += len(sent.text)
+        _maybe_halfway()
         if stats:
             stats.processed_chars += len(sent.text)
             tts_share = getattr(stats, 'tts_progress_share', 1.0)

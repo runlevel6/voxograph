@@ -1,6 +1,6 @@
 # AGENTS.md — Voxograph Memory Bank
 
-> **Project**: voxograph 1.0.0 — EPUB → `.m4b` audiobooks (Kokoro-82M + optional Chatterbox)
+> **Project**: voxograph 1.1.0 — EPUB → `.m4b` audiobooks (Kokoro-82M + optional Chatterbox)
 > **Fork by**: Vlad Reshetov (based on original by Claudio Santini, santinic/audiblez)
 > **Repo**: `/home/vlad/voxograph` (editable install; `origin` = runlevel6/voxograph)
 > **Venv**: `/home/vlad/audiblez_venv` — *name intentionally not renamed* (92 `bin/*` shebangs)
@@ -48,17 +48,17 @@ phonemization, optional Gemini AI for phonetic correction.
 | `voices.py` | 27 | Voice table keyed by lang code + flag emoji. |
 | `voice_samples_cli.py` | 110 | Headless Chatterbox preset builder (`--list/--voice/--lang/--all`). |
 | `config.json` | — | Runtime settings, **gitignored** (holds the API key). |
-| `core/` | 3002 | Engine/pipeline package (see §4.2). |
-| `ui/` | 1584 | wxPython GUI package (see §4.3). |
+| `core/` | 3380 | Engine/pipeline package (see §4.2). |
+| `ui/` | 1580 | wxPython GUI package (see §4.3). |
 
 `core/` = `__init__.py` 220 (re-exports 74 public names, so `import voxograph.core as core` and
-`from voxograph.core import X` are the stable surface) · `constants.py` 48 · `utils.py` 48 ·
-`settings.py` 102 · `text.py` 264 · `nlp.py` 86 · `gemini.py` 770 · `epub.py` 117 · `audio.py` 254 ·
-`voice_samples.py` 200 · `pipeline.py` 449 (holds `main`) · `tts/{kokoro 56, chunking 98,
-chatterbox 289}`.
+`from voxograph.core import X` are the stable surface) · `constants.py` 430 · `utils.py` 48 ·
+`settings.py` 102 · `text.py` 171 · `nlp.py` 86 · `gemini.py` 839 · `epub.py` 117 · `audio.py` 254 ·
+`voice_samples.py` 185 · `pipeline.py` 478 (holds `main`) · `tts/{kokoro 56, chunking 96,
+chatterbox 281}`.
 
 `ui/` = `__init__.py` 25 (re-exports `main`, `MainWindow`, `EVENTS`, `CoreThread`,
-`_extract_bridge_json`, `border`, `BOOK_DETAILS_WRAP_WIDTH`) · `events.py` 20 · `bridge.py` 24 ·
+`_extract_bridge_json`, `border`, `BOOK_DETAILS_WRAP_WIDTH`) · `events.py` 16 · `bridge.py` 24 ·
 `window.py` 59 · `core_thread.py` 20 · `app.py` 15 · `__main__.py` 5 · mixins `menu` 53,
 `layout` 166, `params` 373, `ref_audio` 170, `voice_samples` 135, `settings` 61, `ebook` 119,
 `preview` 197, `synthesis` 77, `core_events` 65.
@@ -72,7 +72,7 @@ chatterbox 289}`.
 voxograph    = voxograph.cli:cli_main
 voxograph-ui = voxograph.ui:main
 ```
-Installed dist-info: `site-packages/voxograph-1.0.0.dist-info/`. Entry points are only on `PATH`
+Installed dist-info: `site-packages/voxograph-1.1.0.dist-info/`. Entry points are only on `PATH`
 after `source /home/vlad/audiblez_venv/bin/activate`.
 
 ### Data outside the package
@@ -133,14 +133,28 @@ No `sys.path` manipulation — imports are absolute.
 
 ### 4.2 `core/`
 
-**`constants.py`** — `sample_rate = 24000` · `_SPOKEN_CHARS_PER_SEC = 12.5` (ETA) ·
-`_AAC_ENCODE_RT_FACTOR = 50` · `CONFIG_FILE = Path(__file__).resolve().parent.parent /
-'config.json'` (two `.parent`s because the module moved one level deeper) ·
-`DEFAULT_VOICE_SAMPLES_DIR = ~/.voxograph/voice_samples` · `CHATTERBOX_DEFAULT_{EXAGGERATION,
-CFG_WEIGHT} = 0.5` · `CHATTERBOX_TURBO_DEFAULT_{TEMPERATURE = 0.8, TOP_P = 0.95, TOP_K = 1000,
-REPETITION_PENALTY = 1.2}` with their `CHATTERBOX_TURBO_*_RANGE` bounds (drives both the spinners
-and the clamping) · `CHATTERBOX_MODEL_{MULTILINGUAL,TURBO}` / `CHATTERBOX_MODELS` /
-`CHATTERBOX_DEFAULT_MODEL = 'multilingual'` · `DEFAULT_VOICE = 'af_heart'`.
+**`constants.py`** (430 lines) — the single source of truth for every named constant in the
+package; each module imports from here instead of defining its own. Audio/timing: `sample_rate =
+24000` · `_SPOKEN_CHARS_PER_SEC = 12.5` (ETA) · `_AAC_ENCODE_RT_FACTOR = 50` · `CHUNK_SILENCE_MS =
+400` · `CONFIG_FILE = Path(__file__).resolve().parent.parent / 'config.json'` (two `.parent`s
+because the module moved one level deeper) · `DEFAULT_VOICE = 'af_heart'`. Voice samples:
+`DEFAULT_VOICE_SAMPLES_DIR = ~/.voxograph/voice_samples` · `VOICE_SAMPLE_TEXT` / `_VERSION` /
+`_INDEX` / `_MIN_SECONDS` / `_TRIM_THRESHOLD` · `CHATTERBOX_VOICE_SOURCES`. Chatterbox:
+`CHATTERBOX_DEFAULT_{EXAGGERATION,CFG_WEIGHT} = 0.5` · `CHATTERBOX_TURBO_DEFAULT_{TEMPERATURE =
+0.8, TOP_P = 0.95, TOP_K = 1000, REPETITION_PENALTY = 1.2}` with their `CHATTERBOX_TURBO_*_RANGE`
+bounds (drives both the spinners and the clamping) · `CHATTERBOX_MODEL_{MULTILINGUAL,TURBO}` /
+`CHATTERBOX_MODELS` / `CHATTERBOX_DEFAULT_MODEL = 'multilingual'` · `CHATTERBOX_MAX_CHUNK_CHARS =
+300` · `CHATTERBOX_MAX_RETRIES = 3` · `CHATTERBOX_BRIDGE_{DIR,PYTHON,SCRIPT}` (dir from
+`VOXOGRAPH_CHATTERBOX_BRIDGE_DIR`) · `CHATTERBOX_T3_MODEL` / `CHATTERBOX_LANGUAGE_ID` /
+`_CHATTERBOX_NOISE_MARKERS` · `_SENTENCE_BOUNDARY_RE` / `_CLAUSE_BOUNDARY_RE`. Text cleaning:
+`ABBREVIATIONS` + compiled `_ABBREV_PATTERNS` · `_ROMAN_RE_SRC` / `_ROMAN_HEADING_RE` /
+`_ROMAN_KEYWORD_RE`. Gemini: `GEMINI_MODELS`, the three rule strings (`_PHONETIC_RULES` /
+`_CHATTERBOX_PHONETIC_RULES` / `_CHATTERBOX_TAG_RULES`), `_AI_MAX_OUTPUT_TOKENS`,
+`_GEMINI_RETRY_DELAYS_SECS` / `_GEMINI_REQUEST_TIMEOUT_{SECS,MS}` · `_NON_RETRYABLE_ERROR_MARKERS`,
+the `_AI_REWRITE_*` / `_AI_MIN_*` sizing, `_AI_{PARAGRAPH,SENTENCE,CLAUSE}_BREAK_RE` and
+`_AI_PART_{MARKER,JOIN}`. UI: `border = 5` · `BOOK_DETAILS_WRAP_WIDTH = 260`. Two deliberate
+exceptions stay outside: `EVENTS` (wx objects, `ui/events.py`) and the voice tables (`voices.py`,
+kept torch-free so `voxograph --help` does not import torch).
 
 **`utils.py`** — `_clamp_unit_float(value, default)` (0–1 clamp) · `_clamp_float(value, low, high,
 default)` / `_clamp_int(value, low, high, default)` (range clamp, used by the Turbo knobs) ·
@@ -151,11 +165,12 @@ default)` / `_clamp_int(value, low, high, default)` (range clamp, used by the Tu
 every key, so old configs load, then `_clamp_turbo_settings()` normalizes the Turbo knobs) ·
 `save_settings(...)` (one big explicit signature; the single source of truth, imported by the UI).
 
-**`text.py`** — `ABBREVIATIONS` + pre-compiled `_ABBREV_PATTERNS`; Roman numeral expansion
-(`_roman_to_int` / `_int_to_words` / `_roman_match_to_words` / `expand_roman_numerals` with
-`_ROMAN_HEADING_RE`, `_ROMAN_KEYWORD_RE`, `_ROMAN_RE_SRC`) — only valid numerals 1–3999, ALL-CAPS
-preserved as Title Case; `clean_text()` = soft hyphens → abbreviations → Roman numerals →
-Unicode punctuation → whitespace → repeated-punctuation collapse.
+**`text.py`** — Roman numeral expansion (`_roman_to_int` / `_int_to_words` /
+`_roman_match_to_words` / `expand_roman_numerals`) — only valid numerals 1–3999, ALL-CAPS preserved
+as Title Case; `clean_text()` = soft hyphens → abbreviations → Roman numerals → Unicode punctuation
+→ whitespace → repeated-punctuation collapse. The `ABBREVIATIONS` table and the
+`_ABBREV_PATTERNS` / `_ROMAN_RE_SRC` / `_ROMAN_*_RE` regexes are defined in `constants.py` and
+re-exported from here.
 
 **`nlp.py`** — `_nlp` module cache (Fix #4) · `get_nlp()` / `load_spacy()` (`xx_ent_wiki_sm` +
 `sentencizer`) · `set_espeak_library()` (Linux/macOS/Windows lookup → `ESPEAK_LIBRARY`) ·
@@ -166,17 +181,18 @@ Unicode punctuation → whitespace → repeated-punctuation collapse.
 lxml over `title/p/h1-h4/li`, Fix #2, applies `clean_text`) · `is_chapter()` · `find_good_chapters()`
 · `pick_chapters()` · `print_selected_chapters()` · `chapter_beginning_one_liner()`.
 
-**`gemini.py`** (944 lines) — `GEMINI_MODELS` (11 models newest-first) + `_try_gemini_models()`,
+**`gemini.py`** (839 lines) — its constants and rule strings live in `constants.py`; the module
+holds the retry/rewrite logic. `GEMINI_MODELS` (11 models newest-first) + `_try_gemini_models()`,
 the default fallback path (`use_model_fallback=True` on every public AI entry point): each model is
 tried **once immediately** — a busy/unavailable (retryable) model moves straight to the next with no
 per-model backoff — and only when **all** models fail does the whole list wait the backoff schedule
 (1/2/3/4 min) and retry (5 rounds). Non-retryable errors (bad key, permission, NOT_FOUND) abort at
 once, since they are not model-specific. A model that produces no response within
-`_GEMINI_REQUEST_TIMEOUT_SECS`=60s is abandoned (`GeminiTimeoutError`, which has no non-retryable
+`_GEMINI_REQUEST_TIMEOUT_SECS`=120s is abandoned (`GeminiTimeoutError`, which has no non-retryable
 marker so it fails over) and the next model is tried · `_call_gemini_with_timeout()` runs each call
 in a daemon worker thread, prints a per-second `[Gemini] <model>: waiting for response, Ns left`
 countdown, and raises on expiry; `_gemini_client()` builds the SDK client with
-`http_options=types.HttpOptions(timeout=_GEMINI_REQUEST_TIMEOUT_MS=45000)` so a hung request is
+`http_options=types.HttpOptions(timeout=_GEMINI_REQUEST_TIMEOUT_MS=120000)` so a hung request is
 aborted socket-side too. Prints `[Gemini] …` diagnostics for each attempt/failure/timeout/round ·
 `_call_gemini_with_retry()` (still used when `use_model_fallback=False`: waits a minute on
 503/high-demand, posts `CORE_AI_RETRY_EXHAUSTED` when it gives up) · every `generate_content` call passes
@@ -204,25 +220,28 @@ with drain threads (avoids the 64 KB pipe-buffer deadlock) · `create_m4b()` (co
 `create_index_file()` (FFMETADATA1 chapters, TIMEBASE=1/1000) · `probe_duration()` (ffprobe) ·
 `delete_wav_files()`.
 
-**`voice_samples.py`** — `VOICE_SAMPLE_TEXT` + `VOICE_SAMPLE_TEXT_VERSION` (bump to force rebuilds;
-`index.json` stores it per voice) · `VOICE_SAMPLE_TRIM_THRESHOLD = 0.005` (~−46 dBFS) ·
-`voice_samples_dir()` / `voice_sample_path()` / `voice_sample_info()` / `voice_sample_exists()` /
-`missing_voice_samples()` · `_trim_edge_silence()` · `generate_voice_sample()` (renders via Kokoro,
+**`voice_samples.py`** — the `VOICE_SAMPLE_*` constants and `CHATTERBOX_VOICE_SOURCES` live in
+`constants.py`; this module owns the logic: `VOICE_SAMPLE_TEXT_VERSION` (bump to force rebuilds;
+`index.json` stores it per voice) · `voice_samples_dir()` / `voice_sample_path()` /
+`voice_sample_info()` / `voice_sample_exists()` / `missing_voice_samples()` · `_trim_edge_silence()` ·
+`generate_voice_sample()` (renders via Kokoro,
 trims, peak-normalizes to 0.708, atomic `.wav.tmp` write with explicit
 `format='WAV', subtype='PCM_16'` — required, soundfile cannot infer from `.wav.tmp`) ·
 `generate_voice_samples()` (batch, one `KPipeline` per lang code) ·
 `resolve_chatterbox_ref_audio(voice, source, custom_path, settings)` — **the single decision
 point** for what Chatterbox clones; never compare/store `.wav` paths anywhere else.
 
-**`tts/chunking.py`** — `CHATTERBOX_MAX_CHUNK_CHARS = 300` (Chatterbox degrades/hallucinates on
-longer input) · `split_chatterbox_text()` splits at paragraph → sentence → clause → word →
+**`tts/chunking.py`** — `CHATTERBOX_MAX_CHUNK_CHARS = 300` (defined in `constants.py`; Chatterbox
+degrades/hallucinates on longer input) · `split_chatterbox_text()` splits at paragraph → sentence →
+clause → word →
 hard, and **packs** whole sentences into a running buffer until the next would exceed the limit,
 so chunks approach 280–300 chars and always end on real punctuation. Never a blind `text[:300]`.
 `preview_excerpt()` returns the first chunk (used by the GUI preview for both engines).
 
-**`tts/chatterbox.py`** — `CHATTERBOX_BRIDGE_DIR` (`VOXOGRAPH_CHATTERBOX_BRIDGE_DIR`, default
-`/home/vlad/chatterbox_venv`) / `_PYTHON` / `_SCRIPT`, `CHATTERBOX_T3_MODEL`,
-`CHATTERBOX_LANGUAGE_ID = 'en'` · `ChatterboxError` (base: dead/absent bridge, `BrokenPipeError`,
+**`tts/chatterbox.py`** — the bridge constants live in `constants.py` (`CHATTERBOX_BRIDGE_DIR`
+(`VOXOGRAPH_CHATTERBOX_BRIDGE_DIR`, default `/home/vlad/chatterbox_venv`) / `_PYTHON` / `_SCRIPT`,
+`CHATTERBOX_T3_MODEL`, `CHATTERBOX_LANGUAGE_ID = 'en'`, `_CHATTERBOX_NOISE_MARKERS`) ·
+`ChatterboxError` (base: dead/absent bridge, `BrokenPipeError`,
 error payloads) / `ChatterboxCancelled(ChatterboxError)` (`stop_event`) · `ChatterboxBridge`
 (spawns `generate.py --serve`, newline-delimited JSON, queue-based responses, stderr drain thread,
 polls `stop_event` every 250 ms, `close()` terminates the child; carries `device`, `ref_audio`,
@@ -250,7 +269,7 @@ waiting for its whole rewrite (a 300K-char chapter is ~10 units) → prepends
 title/author to the first piece of chapter 1 → concatenates, peak-normalizes to 0.708, writes WAV →
 builds the index + M4B → deletes WAVs →
 re-saves settings. Posts `CORE_STARTED` … `CORE_FINISHED`. The Chatterbox per-fragment synthesis is
-wrapped in a retry loop (`chatterbox_max_retries = 3`): a `ChatterboxError` (dead/absent bridge,
+wrapped in a retry loop (`CHATTERBOX_MAX_RETRIES = 3`, from `constants.py`): a `ChatterboxError` (dead/absent bridge,
 e.g. `BrokenPipeError` when the subprocess dies mid-chapter) closes the bridge, re-spawns it via
 `_recreate_chatterbox_bridge()` and re-synthesizes that fragment; `ChatterboxCancelled`
 is re-raised first for a clean `stop_event` stop, and once the retries are exhausted `CORE_ERROR`
@@ -260,7 +279,8 @@ is posted and the run ends gracefully.
 
 **Events** (`events.py`): `CORE_STARTED`, `CORE_PROGRESS`, `CORE_CHAPTER_STARTED`,
 `CORE_CHAPTER_FINISHED`, `CORE_AI_REWRITE`, `CORE_AI_RETRY_EXHAUSTED`, `CORE_ERROR`,
-`CORE_FINISHED`. Plus `border = 5`, `BOOK_DETAILS_WRAP_WIDTH = 260`.
+`CORE_FINISHED`. The layout values `border = 5` and `BOOK_DETAILS_WRAP_WIDTH = 260` are imported
+from `core.constants`; `EVENTS` (wx objects) is the only constant that stays here.
 
 **Mixins** — `menu` (Open Ctrl+O / Exit Ctrl+Q) · `layout` (top bar, splitter, right column; the
 right column is a `ScrolledPanel` so tall parameter stacks stay reachable, and boxes are added with
@@ -399,11 +419,10 @@ There is **no test suite** — verification is `py_compile`, import smoke checks
 - **`pip check` reports venv/pyproject drift**: `phonemizer` not installed (a `phonemizer-fork` is
   installed instead), `kokoro` 0.7.16 vs the `==0.9.4` pin, `misaki` 0.7.17 vs `>=0.9.2`. The app
   works, but the pins no longer describe the machine.
-- **The `v1.0.0` release tag predates the current work**: the UI package port, the Chatterbox
-  Turbo/tag/bridge changes and the bridge-retry logic all landed in later commits
-  (`9037f6c` … `8ac9bd4`), so the tag is not the working tree. The tree is otherwise clean; the
-  only local change is the `ChatterboxCancelled` import hotfix (§10, 2026-10-07).
-- **PyPI publish is not wired up**: the `v1.0.0` publish run failed with `invalid-publisher`; a
+- **The `v1.1.0` release tag is the current working tree**: the UI package port, the Chatterbox
+  Turbo/tag/bridge changes, the bridge-retry logic, and the Gemini/TTS overlap work all landed in
+  commits prior to this tag. The tree is otherwise clean.
+- **PyPI publish is not wired up**: the `v1.1.0` publish run failed with `invalid-publisher`; a
   Trusted Publisher must be registered for project `voxograph` / repo `voxograph` / workflow
   `publish.yml` / environment `pypi`.
 - **Chatterbox is effectively English-locked** here: `CHATTERBOX_LANGUAGE_ID = 'en'`, and Turbo is
@@ -413,6 +432,31 @@ There is **no test suite** — verification is `py_compile`, import smoke checks
 
 ## 10. Recent Changes
 
+- **2026-10-11 — `v1.1.0` release.** Version bumped to `1.1.0` in `pyproject.toml` and the
+  memory bank (§1, §2, §9). This tag is the current working tree: the UI package port, the
+  Chatterbox Turbo/tag/bridge changes, the bridge-retry logic, and the Gemini/TTS overlap work
+  all landed in commits prior to this tag. The tree is otherwise clean; the only local change
+  is the `ChatterboxCancelled` import hotfix (§10, 2026-10-07). `compileall` clean; `voxograph
+  --help` still torch-free.
+- **2026-10-11 — Gemini and TTS now overlap at 50% instead of being strictly serialized.** The AI chapter loop in `pipeline.main` used to pull the next piece with `next(ai_pieces)` only *after* the current piece finished synthesizing — so the next Gemini request was sent only after TTS fully completed (TTS → Gemini → TTS → Gemini, with no overlap). A long chapter's ~10 fragments therefore meant ~10 sequential round-trips before the first audio. New `on_halfway` callbacks on `gen_audio_segments` (Kokoro) and `gen_audio_segments_chatterbox` fire once the current piece is ~50% spoken (tracked by characters, which maps to audio duration better than a raw sentence/chunk count); `pipeline.main` starts the next `next(ai_pieces)` in a **background daemon thread** at that point, so the rest of this piece's TTS and the next Gemini rewrite run **in parallel**. A `fetch_state` dict (`piece`/`thread`) guards against a fetch already in flight — short pieces that cross 50% more than once (per-sentence callback) don't double-fetch — and the loop joins the background thread before reading the ready piece, falling back to a synchronous pull for pieces so short they finish before the halfway point. Verified offline: `on_halfway` fires exactly once per piece; a 3-piece run with simulated 0.2s TTS and 0.3s fetches started the fetch while TTS was still active (overlap detected), and produced all 6 expected segments. `py_compile` + `core` import clean.
+- **2026-10-11 — All package constants consolidated into `core/constants.py`.** Every module-level
+  constant that used to be defined beside its logic now lives in `core/constants.py` (the single
+  source of truth) and is imported from there: the text-cleaning tables/regexes (`ABBREVIATIONS`,
+  `_ABBREV_PATTERNS`, `_ROMAN_*`) from `text.py`; the Chatterbox bridge paths/model/language/noise
+  markers from `tts/chatterbox.py`; `CHATTERBOX_MAX_CHUNK_CHARS` and the sentence/clause boundary
+  regexes from `tts/chunking.py`; `GEMINI_MODELS`, `_PHONETIC_RULES` / `_CHATTERBOX_PHONETIC_RULES`
+  / `_CHATTERBOX_TAG_RULES`, all `_AI_*` / `_GEMINI_*` sizing/retry values and break regexes from
+  `gemini.py`; the `VOICE_SAMPLE_*` / `CHATTERBOX_VOICE_SOURCES` values from `voice_samples.py`;
+  and the UI `border` / `BOOK_DETAILS_WRAP_WIDTH` from `ui/events.py`. `CHATTERBOX_MAX_RETRIES`
+  replaces the function-local `chatterbox_max_retries = 3` in `pipeline.py`. `core/__init__.py`
+  now sources these names from `constants` (re-export surface and all prior
+  `voxograph.core.<module>.<CONST>` import paths preserved — `text.py` re-exports its two
+  otherwise-unused names). Two constants deliberately stay outside: `EVENTS` (wx objects, in
+  `ui/events.py` — core must import headless) and the voice tables in `voices.py` (moving them
+  would make `voxograph --help` import torch, ~8.2 s vs 1 ms). Verified: `compileall` clean; every
+  `core.__all__` name resolves; moved constants are identical objects at their old module paths;
+  `clean_text`/chunking/`_ai_split_paragraphs`/`_ai_take_prefix` behaviour unchanged; headless
+  `MainWindow` construction (`DISPLAY=:1`) OK; `voxograph --help` still torch-free.
 - **2026-10-10 — Fragment-level AI/TTS interleaving (fixes "Gemini responds but no audio").**
   The pipeline used to drive `iter_correct_phonetics_ai_chapters()`, which withholds a chapter until
   **all** of its AI fragments are rewritten. A real ~300K-char chapter is split into ~10 units

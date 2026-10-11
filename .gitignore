@@ -9,6 +9,9 @@ venv/
 # Local editor settings (machine-specific interpreter path)
 .vscode/
 
+# Agent runtime config (Kilo sessions, not part of the deliverable)
+.kilo/
+
 # Secrets (contains Gemini API key / user settings)
 voxograph/config.json
 config.json

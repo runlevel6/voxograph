@@ -8,7 +8,11 @@ import time
 from pathlib import Path
 from kokoro import KPipeline
 
-from .constants import DEFAULT_VOICE_SAMPLES_DIR, sample_rate
+from .constants import (
+    CHATTERBOX_VOICE_SOURCES, DEFAULT_VOICE_SAMPLES_DIR, VOICE_SAMPLE_INDEX,
+    VOICE_SAMPLE_MIN_SECONDS, VOICE_SAMPLE_TEXT, VOICE_SAMPLE_TEXT_VERSION,
+    VOICE_SAMPLE_TRIM_THRESHOLD, sample_rate,
+)
 from .settings import load_settings
 from .nlp import lang_code_from_voice, set_espeak_library
 from .tts.kokoro import gen_audio_segments
@@ -24,25 +28,6 @@ from .tts.kokoro import gen_audio_segments
 # Preset name == Kokoro voice name, so the two engines share one dropdown and
 # no .wav path ever has to be managed by hand (a custom WAV stays available).
 # ---------------------------------------------------------------------------
-
-# Neutral English narration with wide phoneme coverage and no proper nouns
-# (proper nouns get mispronounced by G2P and would pollute the clone).
-VOICE_SAMPLE_TEXT = (
-    "The north wind and the south wind move gently across the quiet valley, "
-    "where a small brown fox jumps over a lazy dog beside the riverbank. "
-    "She sells seashells by the shimmering seashore, and the old sailors sing "
-    "songs about silver moonlit oceans and patient constellations."
-)
-
-# Bump when VOICE_SAMPLE_TEXT changes: samples recorded under an older script
-# are reported as missing so they get rebuilt instead of silently cloned.
-VOICE_SAMPLE_TEXT_VERSION = 1
-
-VOICE_SAMPLE_INDEX = 'index.json'
-VOICE_SAMPLE_MIN_SECONDS = 5.0
-VOICE_SAMPLE_TRIM_THRESHOLD = 0.005   # ~ -46 dBFS, safely below speech level
-
-CHATTERBOX_VOICE_SOURCES = ('preset', 'custom')
 
 
 def voice_samples_dir(settings=None):

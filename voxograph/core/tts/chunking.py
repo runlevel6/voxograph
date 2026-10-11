@@ -3,11 +3,9 @@
 
 import re
 
-
-CHATTERBOX_MAX_CHUNK_CHARS = 300
-
-_SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?\u2026])\s+')
-_CLAUSE_BOUNDARY_RE = re.compile(r'(?<=[,;:])\s+')
+from ..constants import (
+    CHATTERBOX_MAX_CHUNK_CHARS, _CLAUSE_BOUNDARY_RE, _SENTENCE_BOUNDARY_RE,
+)
 
 
 def _split_oversized_sentence(sentence, max_chars):

@@ -1,6 +1,8 @@
 """voxograph.ui.events - wx event table and shared layout constants."""
 from wx.lib.newevent import NewEvent
 
+from voxograph.core.constants import BOOK_DETAILS_WRAP_WIDTH, border
+
 
 EVENTS = {
     'CORE_STARTED': NewEvent(),
@@ -12,9 +14,3 @@ EVENTS = {
     'CORE_ERROR': NewEvent(),
     'CORE_FINISHED': NewEvent()
 }
-
-border = 5
-
-# Long titles/authors wrap at this width so the Book Details box (and with it
-# the whole right column) stays compact instead of growing to the text length.
-BOOK_DETAILS_WRAP_WIDTH = 260
