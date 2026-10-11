@@ -1,7 +1,9 @@
 """voxograph.core.gemini - Gemini retry helper, phonetic rules, and AI pronunciation rewrites."""
 
 
+import math
 import re
+import threading
 import time
 from google import genai
 from google.genai import types
@@ -52,6 +54,167 @@ _GEMINI_RETRY_DELAYS_SECS = [60, 120, 180, 240]
 # immediately instead of making the caller wait up to 10 minutes for nothing.
 _NON_RETRYABLE_ERROR_MARKERS = ('NOT_FOUND', 'PERMISSION_DENIED', 'INVALID_ARGUMENT', 'UNAUTHENTICATED')
 
+# Hard ceiling on a single Gemini request. A watchdog thread prints a live
+# countdown while the call is in flight; if no response arrives in this window
+# the model is abandoned and the next one is tried. The SDK client is also
+# built with the same HTTP timeout (HttpOptions.timeout is in milliseconds)
+# so the hung request is actually aborted on the client side rather than
+# lingering until the OS-level TCP timeout.
+_GEMINI_REQUEST_TIMEOUT_SECS = 60
+_GEMINI_REQUEST_TIMEOUT_MS = _GEMINI_REQUEST_TIMEOUT_SECS * 1000
+
+
+class GeminiTimeoutError(RuntimeError):
+    """No response from a Gemini model within _GEMINI_REQUEST_TIMEOUT_SECS.
+
+    The message carries no non-retryable marker, so the model-fallback loop
+    treats it as transient and moves straight on to the next model."""
+
+
+# Ordered list of Gemini models to try sequentially until one succeeds.
+# Newer models first; the first available/working model will be used.
+GEMINI_MODELS = (
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+)
+
+
+def _gemini_client(api_key):
+    """Build a Gemini client whose HTTP requests time out after
+    _GEMINI_REQUEST_TIMEOUT_SECS seconds."""
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=_GEMINI_REQUEST_TIMEOUT_MS),
+    )
+
+
+def _render_progress_bar(elapsed, total, width=20):
+    """Render a text progress bar showing elapsed/total progress."""
+    fraction = max(0.0, min(1.0, elapsed / total))
+    filled = int(width * fraction)
+    bar = '█' * filled + '░' * (width - filled)
+    return f'[{bar}]'
+
+
+def _call_gemini_with_timeout(func, *args, timeout=_GEMINI_REQUEST_TIMEOUT_SECS,
+                              stop_event=None, label=None, **kwargs):
+    """Run func(*args, **kwargs) under a watchdog and print a live progress bar.
+
+    The call runs in a daemon worker thread so the main thread can update the
+    progress bar each second. If func does not return within `timeout`
+    seconds, a GeminiTimeoutError is raised so the caller can try the next
+    model. The worker also carries the same HTTP timeout on its client, so a
+    hung request is abandoned on both the watchdog and the socket side.
+    """
+    outcome = {}
+
+    def _run():
+        try:
+            outcome['value'] = func(*args, **kwargs)
+        except BaseException as exc:  # reported to the caller below
+            outcome['exc'] = exc
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    start = time.monotonic()
+    label = label or 'model'
+    printed = False
+
+    while worker.is_alive():
+        elapsed = time.monotonic() - start
+        remaining = timeout - elapsed
+        if remaining <= 0:
+            break
+        if stop_event and stop_event.is_set():
+            break
+        bar = _render_progress_bar(elapsed, timeout)
+        print(f'\033[96m[Gemini] {label}: waiting for response {bar} '
+              f'{math.ceil(remaining)}s left\033[0m', end='\r', flush=True)
+        printed = True
+        worker.join(min(1.0, remaining))
+
+    if printed:
+        # Move to a fresh line so subsequent output does not overwrite the bar.
+        print()
+
+    if stop_event and stop_event.is_set():
+        raise RuntimeError('Stopped by user.')
+    if worker.is_alive():
+        raise GeminiTimeoutError(
+            f'No response from {label} within {timeout}s.')
+    if 'exc' in outcome:
+        raise outcome['exc']
+    return outcome['value']
+
+
+def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
+    """
+    Try calling func(model, *args, **kwargs) with each model in GEMINI_MODELS
+    until one succeeds. func must accept `model` as its first argument.
+
+    Each model is tried once, immediately: a busy/unavailable model (retryable
+    error) moves straight to the next model instead of waiting out the backoff
+    schedule on the same one. A model that produces no response within
+    _GEMINI_REQUEST_TIMEOUT_SECS (60s) is abandoned and the next model is
+    tried. Only when EVERY model fails in a pass does the whole list wait a
+    backoff delay and get retried (1, 2, 3, then 4 minutes); after the last
+    round the final exception is raised.
+
+    Permanent errors (bad key, permission denied, invalid argument) are not
+    model-specific, so they abort immediately without trying other models.
+    """
+    last_exc = None
+    total_rounds = len(_GEMINI_RETRY_DELAYS_SECS) + 1
+    for round_index in range(total_rounds):
+        if round_index > 0:
+            print(f'\033[96m[Gemini] Retry round {round_index}/{total_rounds - 1} '
+                  f'(all {len(GEMINI_MODELS)} models)\033[0m')
+        for i, model in enumerate(GEMINI_MODELS):
+            if stop_event and stop_event.is_set():
+                if last_exc:
+                    raise last_exc
+                raise RuntimeError('Stopped by user.')
+            print(f'\033[96m[Gemini] Trying model {i+1}/{len(GEMINI_MODELS)}: {model}\033[0m')
+            try:
+                return _call_gemini_with_timeout(func, model, *args,
+                                                 stop_event=stop_event, label=model, **kwargs)
+            except GeminiTimeoutError as e:
+                last_exc = e
+                print(f'\033[93m[Gemini] Model {model} gave no response within '
+                      f'{_GEMINI_REQUEST_TIMEOUT_SECS}s. Trying next model...\033[0m')
+                continue
+            except Exception as e:
+                last_exc = e
+                if stop_event and stop_event.is_set():
+                    raise
+                # Permanent error: not model-specific, so no point trying others.
+                if not _is_retryable_gemini_error(e):
+                    print(f'\033[91m[Gemini] Model {model} failed with non-retryable error: {e}\033[0m')
+                    print('\033[91m[Gemini] Stopping model fallback (error likely not model-specific)\033[0m')
+                    raise
+                # Busy/unavailable: try the next model right away.
+                print(f'\033[93m[Gemini] Model {model} failed: {e}. Trying next model...\033[0m')
+        if round_index < len(_GEMINI_RETRY_DELAYS_SECS):
+            delay = _GEMINI_RETRY_DELAYS_SECS[round_index]
+            print(f'\033[93m[Gemini] All {len(GEMINI_MODELS)} models failed. Waiting '
+                  f'{delay // 60} minute(s) before retrying the full list '
+                  f'(round {round_index + 2}/{total_rounds})...\033[0m')
+            _sleep_with_stop_event(delay, stop_event)
+    if post_event and last_exc and _is_retryable_gemini_error(last_exc):
+        post_event('CORE_AI_RETRY_EXHAUSTED', message=f'All models failed. Last error: {last_exc}')
+    print(f'\033[91m[Gemini] All {len(GEMINI_MODELS)} models failed across '
+          f'{total_rounds} round(s). Giving up.\033[0m')
+    raise last_exc
+
 
 def _is_retryable_gemini_error(exc) -> bool:
     msg = str(exc)
@@ -84,22 +247,27 @@ def _call_gemini_with_retry(func, *args, stop_event=None, post_event=None, **kwa
     all retries are exhausted due to transient errors.
     """
     last_exc = None
-    for attempt in range(len(_GEMINI_RETRY_DELAYS_SECS) + 1):
+    total_attempts = len(_GEMINI_RETRY_DELAYS_SECS) + 1
+    for attempt in range(total_attempts):
         if stop_event and stop_event.is_set():
             if last_exc:
                 raise last_exc
             raise RuntimeError('Stopped by user.')
+        if attempt > 0:
+            print(f'\033[96m[Gemini] Retry attempt {attempt}/{total_attempts - 1}\033[0m')
         try:
-            return func(*args, **kwargs)
+            return _call_gemini_with_timeout(func, *args, stop_event=stop_event, **kwargs)
         except Exception as e:
             last_exc = e
             more_attempts_left = attempt < len(_GEMINI_RETRY_DELAYS_SECS)
             if more_attempts_left and _is_retryable_gemini_error(e):
                 delay = _GEMINI_RETRY_DELAYS_SECS[attempt]
-                print(f'\033[93mGemini call failed ({e}). Retrying in {delay // 60} '
-                      f'minute(s)... (attempt {attempt + 2}/{len(_GEMINI_RETRY_DELAYS_SECS) + 1})\033[0m')
+                print(f'\033[93m[Gemini] Call failed ({e}). Retrying in {delay // 60} '
+                      f'minute(s)... (attempt {attempt + 2}/{total_attempts})\033[0m')
                 _sleep_with_stop_event(delay, stop_event)
             else:
+                if not more_attempts_left:
+                    print(f'\033[91m[Gemini] All retry attempts exhausted ({total_attempts} total)\033[0m')
                 break
     if post_event and last_exc and _is_retryable_gemini_error(last_exc):
         post_event('CORE_AI_RETRY_EXHAUSTED', message=str(last_exc))
@@ -241,7 +409,7 @@ def _phonetic_rules_for(tts_engine, chatterbox_model=None):
 
 def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite',
                                     stop_event=None, tts_engine='kokoro',
-                                    chatterbox_model=None):
+                                    chatterbox_model=None, use_model_fallback=True):
     """
     Use Google Gemini AI to analyze text for potential TTS pronunciation issues
     and provide phonetic transcription guidance.
@@ -255,6 +423,9 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
     The analysis prompt below shares _PHONETIC_RULES with
     _ai_rewrite_single_chunk so the explanation and the actual rewrite can
     never disagree about what counts as an issue worth fixing.
+
+    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
+    until one succeeds. If False, uses the specified `model` only.
     """
     if not text.strip():
         return "Error: text is empty."
@@ -268,10 +439,10 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
     rules = _phonetic_rules_for(tts_engine, chatterbox_model)
     engine_name = 'Chatterbox' if tts_engine == 'chatterbox' else 'Kokoro'
 
-    def _do_call():
-        client = genai.Client(api_key=api_key)
+    def _do_call(m):
+        client = _gemini_client(api_key)
         return client.models.generate_content(
-            model=model,
+            model=m,
             contents=(
                 f"You are a phonetic transcription expert for a {engine_name} text-to-speech system. "
                 "Analyze the following text from an audiobook and identify words or phrases "
@@ -293,7 +464,10 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
         )
 
     try:
-        response = _call_gemini_with_retry(_do_call, stop_event=stop_event)
+        if use_model_fallback:
+            response = _try_gemini_models(_do_call, stop_event=stop_event)
+        else:
+            response = _call_gemini_with_retry(lambda: _do_call(model), stop_event=stop_event)
         analysis = response.text.strip()
     except Exception as e:
         msg = str(e)
@@ -308,7 +482,8 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
     # so the preview matches reality rather than just describing changes.
     rewritten_text = correct_phonetics_ai(text, api_key, model=model,
                                           stop_event=stop_event, tts_engine=tts_engine,
-                                          chatterbox_model=chatterbox_model)
+                                          chatterbox_model=chatterbox_model,
+                                          use_model_fallback=use_model_fallback)
 
     return (
         f"{analysis}\n\n"
@@ -517,7 +692,7 @@ def _ai_pack_units(chapters, max_chars, min_chars):
 def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
                          stop_event=None, post_event=None,
                          chapter_index=None, chapter_total=None, tts_engine='kokoro',
-                         chatterbox_model=None):
+                         chatterbox_model=None, use_model_fallback=True):
     """
     Use Google Gemini AI to silently rewrite text for TTS-friendly pronunciation.
 
@@ -528,6 +703,9 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
 
     `tts_engine` selects which phonetic ruleset to apply: Kokoro accepts inline
     IPA overrides, while Chatterbox must be fed plain-English respellings only.
+
+    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
+    until one succeeds. If False, uses the specified `model` only.
 
     Returns the corrected text string suitable for direct use as TTS input.
     If AI cannot be reached or returns invalid output, the original text is
@@ -544,7 +722,7 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
     if len(chunks) == 1:
         return _ai_rewrite_single_chunk(chunks[0], api_key, model, stop_event=stop_event,
                                         post_event=post_event, tts_engine=tts_engine,
-                                        chatterbox_model=chatterbox_model)
+                                        chatterbox_model=chatterbox_model, use_model_fallback=use_model_fallback)
 
     rewritten = []
     for idx, chunk in enumerate(chunks, start=1):
@@ -556,7 +734,7 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
                        chunk_index=idx, chunk_total=len(chunks))
         out = _ai_rewrite_single_chunk(chunk, api_key, model, stop_event=stop_event,
                                        post_event=post_event, tts_engine=tts_engine,
-                                       chatterbox_model=chatterbox_model)
+                                       chatterbox_model=chatterbox_model, use_model_fallback=use_model_fallback)
         if out == chunk:
             rewritten.append(chunk)
         else:
@@ -565,7 +743,7 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
 
 
 def _ai_rewrite_combined_unit(unit, api_key, model, stop_event=None, post_event=None,
-                              tts_engine='kokoro', chatterbox_model=None):
+                              tts_engine='kokoro', chatterbox_model=None, use_model_fallback=True):
     """Rewrite several chapters in one Gemini request, joined by
     _AI_PART_MARKER, and return a list of rewritten pieces matching `unit`.
 
@@ -577,7 +755,7 @@ def _ai_rewrite_combined_unit(unit, api_key, model, stop_event=None, post_event=
     rewritten = _ai_rewrite_single_chunk(
         combined, api_key, model, stop_event=stop_event, post_event=post_event,
         tts_engine=tts_engine, chatterbox_model=chatterbox_model,
-        part_separator=_AI_PART_MARKER, part_count=len(unit))
+        part_separator=_AI_PART_MARKER, part_count=len(unit), use_model_fallback=use_model_fallback)
     parts = [part.strip() for part in rewritten.split(_AI_PART_MARKER)]
     if len(parts) == len(unit) and all(parts):
         return parts
@@ -587,28 +765,78 @@ def _ai_rewrite_combined_unit(unit, api_key, model, stop_event=None, post_event=
     return [
         _ai_rewrite_single_chunk(text, api_key, model, stop_event=stop_event,
                                  post_event=post_event, tts_engine=tts_engine,
-                                 chatterbox_model=chatterbox_model)
+                                 chatterbox_model=chatterbox_model, use_model_fallback=use_model_fallback)
         for _, text in unit
     ]
 
 
 def _rewrite_packed_unit(unit, api_key, model, stop_event=None, post_event=None,
-                         tts_engine='kokoro', chatterbox_model=None):
+                         tts_engine='kokoro', chatterbox_model=None, use_model_fallback=True):
     """Rewrite exactly one packed AI unit and return the rewritten piece texts
     in the same order as `unit`. A single-piece unit is a plain request; a
     multi-piece unit is joined with the part marker and split back."""
     if len(unit) == 1:
         return [_ai_rewrite_single_chunk(
             unit[0][1], api_key, model, stop_event=stop_event, post_event=post_event,
-            tts_engine=tts_engine, chatterbox_model=chatterbox_model)]
+            tts_engine=tts_engine, chatterbox_model=chatterbox_model, use_model_fallback=use_model_fallback)]
     return _ai_rewrite_combined_unit(
         unit, api_key, model, stop_event=stop_event, post_event=post_event,
-        tts_engine=tts_engine, chatterbox_model=chatterbox_model)
+        tts_engine=tts_engine, chatterbox_model=chatterbox_model, use_model_fallback=use_model_fallback)
+
+
+def _iter_correct_phonetics_ai_pieces(chapters, api_key, model='gemini-3.1-flash-lite',
+                                      stop_event=None, post_event=None, tts_engine='kokoro',
+                                      chatterbox_model=None, chapter_total=None, use_model_fallback=True):
+    """Rewrite a run of chapters for TTS and yield every piece as it returns.
+
+    Same packing and per-request rewriting as
+    iter_correct_phonetics_ai_chapters, but WITHOUT its all-or-nothing chapter
+    gate: each rewritten piece is handed to the caller the moment its request
+    comes back, tagged with `is_last_piece` (True on the final piece of a
+    chapter). That lets the synthesis loop start speaking a long chapter after
+    its first fragment instead of waiting for the whole chapter to be
+    rewritten — a 300K+ char chapter is split into a dozen units, so the gate
+    used to leave the TTS loop silent for a dozen back-to-back Gemini requests.
+
+    Yields (chapter_index, rewritten_piece, is_last_piece). A chapter that fits
+    in one piece yields exactly one tuple with is_last_piece=True.
+    """
+    if not chapters:
+        return
+
+    api_key = _sanitize_api_key(api_key)
+    if not api_key or not api_key.startswith('AIza'):
+        return
+
+    units = _ai_pack_units(chapters, _AI_REWRITE_MAX_CHARS, _AI_MIN_AGGREGATE_CHARS)
+
+    # How many pieces each chapter is split into across the units, so the last
+    # one can be flagged for the caller.
+    pieces_total = {}
+    for unit in units:
+        for chapter_index, _text in unit:
+            pieces_total[chapter_index] = pieces_total.get(chapter_index, 0) + 1
+
+    pieces_seen = {}
+    for index, unit in enumerate(units, start=1):
+        if stop_event and stop_event.is_set():
+            return
+        if post_event:
+            post_event('CORE_AI_REWRITE', chapter_index=unit[0][0],
+                       chapter_total=chapter_total,
+                       chunk_index=index, chunk_total=len(units))
+        rewritten = _rewrite_packed_unit(
+            unit, api_key, model, stop_event=stop_event, post_event=post_event,
+            tts_engine=tts_engine, chatterbox_model=chatterbox_model, use_model_fallback=use_model_fallback)
+        for (chapter_index, _text), out in zip(unit, rewritten):
+            seen = pieces_seen.get(chapter_index, 0) + 1
+            pieces_seen[chapter_index] = seen
+            yield chapter_index, out, seen >= pieces_total[chapter_index]
 
 
 def iter_correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flash-lite',
                                        stop_event=None, post_event=None, tts_engine='kokoro',
-                                       chatterbox_model=None, chapter_total=None):
+                                       chatterbox_model=None, chapter_total=None, use_model_fallback=True):
     """Rewrite a run of chapters for TTS, one packed AI request at a time.
 
     `chapters` is a list of (chapter_index, text). Chapters below
@@ -622,60 +850,43 @@ def iter_correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flas
     the caller drives it lazily: TTS can run on each chapter before the next
     AI request is issued, spreading the API calls out in time (AI -> TTS ->
     AI -> TTS) instead of firing every request up front.
+
+    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
+    until one succeeds. If False, uses the specified `model` only.
     """
-    if not chapters:
-        return
-
-    api_key = _sanitize_api_key(api_key)
-    if not api_key or not api_key.startswith('AIza'):
-        return
-
-    units = _ai_pack_units(chapters, _AI_REWRITE_MAX_CHARS, _AI_MIN_AGGREGATE_CHARS)
-
-    # How many pieces each chapter is split into across the units. A chapter is
-    # only yielded once all of its pieces have come back.
-    pieces_total = {}
-    for unit in units:
-        for chapter_index, _text in unit:
-            pieces_total[chapter_index] = pieces_total.get(chapter_index, 0) + 1
-
     pieces_by_chapter = {}
-    for index, unit in enumerate(units, start=1):
-        if stop_event and stop_event.is_set():
-            return
-        if post_event:
-            post_event('CORE_AI_REWRITE', chapter_index=unit[0][0],
-                       chapter_total=chapter_total,
-                       chunk_index=index, chunk_total=len(units))
-        rewritten = _rewrite_packed_unit(
-            unit, api_key, model, stop_event=stop_event, post_event=post_event,
-            tts_engine=tts_engine, chatterbox_model=chatterbox_model)
-        for (chapter_index, _text), out in zip(unit, rewritten):
-            pieces = pieces_by_chapter.setdefault(chapter_index, [])
-            pieces.append(out)
-            if len(pieces) >= pieces_total[chapter_index]:
-                yield chapter_index, '\n\n'.join(piece for piece in pieces if piece)
+    for chapter_index, out, is_last in _iter_correct_phonetics_ai_pieces(
+            chapters, api_key, model=model, stop_event=stop_event, post_event=post_event,
+            tts_engine=tts_engine, chatterbox_model=chatterbox_model,
+            chapter_total=chapter_total, use_model_fallback=use_model_fallback):
+        pieces = pieces_by_chapter.setdefault(chapter_index, [])
+        pieces.append(out)
+        if is_last:
+            yield chapter_index, '\n\n'.join(piece for piece in pieces if piece)
 
 
 def correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flash-lite',
                                   stop_event=None, post_event=None, tts_engine='kokoro',
-                                  chatterbox_model=None, chapter_total=None):
+                                  chatterbox_model=None, chapter_total=None, use_model_fallback=True):
     """Rewrite a run of chapters for TTS, packing them into AI requests.
 
     Eager variant of iter_correct_phonetics_ai_chapters: consumes the whole
     series up front and returns a dict mapping chapter_index -> rewritten text.
     Chapters are joined back with blank lines, mirroring correct_phonetics_ai's
     multi-chunk output.
+
+    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
+    until one succeeds. If False, uses the specified `model` only.
     """
     return dict(iter_correct_phonetics_ai_chapters(
         chapters, api_key, model=model, stop_event=stop_event, post_event=post_event,
         tts_engine=tts_engine, chatterbox_model=chatterbox_model,
-        chapter_total=chapter_total))
+        chapter_total=chapter_total, use_model_fallback=use_model_fallback))
 
 
-def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=None,
+def _ai_rewrite_single_chunk(text, api_key, model='gemini-3.1-flash-lite', stop_event=None, post_event=None,
                              tts_engine='kokoro', chatterbox_model=None,
-                             part_separator=None, part_count=0):
+                             part_separator=None, part_count=0, use_model_fallback=True):
     """Single-chunk Gemini call used by correct_phonetics_ai. Falls back to
     the original text on any failure or invalid output (after retries).
 
@@ -687,6 +898,9 @@ def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=N
     When `part_separator` is set, `text` is several chapters joined by that
     exact marker; the model is told to preserve every marker so the caller can
     split the rewrite back into chapters.
+
+    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
+    until one succeeds. If False, uses the specified `model` only.
     """
     engine_name = 'Chatterbox' if tts_engine == 'chatterbox' else 'Kokoro'
     rules = _phonetic_rules_for(tts_engine, chatterbox_model)
@@ -701,10 +915,10 @@ def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=N
             "rewritten chapters can be split back apart.\n\n"
         )
 
-    def _do_call():
-        client = genai.Client(api_key=api_key)
+    def _do_call(m):
+        client = _gemini_client(api_key)
         return client.models.generate_content(
-            model=model,
+            model=m,
             contents=(
                 f"You are a phonetic preprocessing step for the {engine_name} TTS engine. "
                 "You will do this in two steps, and your response MUST contain both "
@@ -733,7 +947,10 @@ def _ai_rewrite_single_chunk(text, api_key, model, stop_event=None, post_event=N
         )
 
     try:
-        response = _call_gemini_with_retry(_do_call, stop_event=stop_event, post_event=post_event)
+        if use_model_fallback:
+            response = _try_gemini_models(_do_call, stop_event=stop_event, post_event=post_event)
+        else:
+            response = _call_gemini_with_retry(lambda: _do_call(model), stop_event=stop_event, post_event=post_event)
     except Exception as e:
         print(f'\033[91mGemini rewrite failed, keeping original text for this chunk: {e}\033[0m')
         return text

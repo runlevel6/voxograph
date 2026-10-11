@@ -166,18 +166,30 @@ Unicode punctuation → whitespace → repeated-punctuation collapse.
 lxml over `title/p/h1-h4/li`, Fix #2, applies `clean_text`) · `is_chapter()` · `find_good_chapters()`
 · `pick_chapters()` · `print_selected_chapters()` · `chapter_beginning_one_liner()`.
 
-**`gemini.py`** (770 lines) — `_call_gemini_with_retry()` (waits a minute on 503/high-demand, posts
-`CORE_AI_RETRY_EXHAUSTED` when it gives up) · every `generate_content` call passes
+**`gemini.py`** (944 lines) — `GEMINI_MODELS` (11 models newest-first) + `_try_gemini_models()`,
+the default fallback path (`use_model_fallback=True` on every public AI entry point): each model is
+tried **once immediately** — a busy/unavailable (retryable) model moves straight to the next with no
+per-model backoff — and only when **all** models fail does the whole list wait the backoff schedule
+(1/2/3/4 min) and retry (5 rounds). Non-retryable errors (bad key, permission, NOT_FOUND) abort at
+once, since they are not model-specific. A model that produces no response within
+`_GEMINI_REQUEST_TIMEOUT_SECS`=60s is abandoned (`GeminiTimeoutError`, which has no non-retryable
+marker so it fails over) and the next model is tried · `_call_gemini_with_timeout()` runs each call
+in a daemon worker thread, prints a per-second `[Gemini] <model>: waiting for response, Ns left`
+countdown, and raises on expiry; `_gemini_client()` builds the SDK client with
+`http_options=types.HttpOptions(timeout=_GEMINI_REQUEST_TIMEOUT_MS=45000)` so a hung request is
+aborted socket-side too. Prints `[Gemini] …` diagnostics for each attempt/failure/timeout/round ·
+`_call_gemini_with_retry()` (still used when `use_model_fallback=False`: waits a minute on
+503/high-demand, posts `CORE_AI_RETRY_EXHAUSTED` when it gives up) · every `generate_content` call passes
 `config=_ai_generate_config()`, i.e. `GenerateContentConfig(max_output_tokens=_AI_MAX_OUTPUT_TOKENS
 =65536)`, to override the SDK/model default · `_ai_rewrite_single_chunk()` /
 `_ai_split_paragraphs()` / `_ai_split_overlong()` / `_ai_split_hard()` / `_extract_rewritten_section()` · `correct_phonetics_ai()` (rewrites one
-chapter) · `_rewrite_packed_unit()` (one packed request) · `iter_correct_phonetics_ai_chapters()`
-(generator: cross-chapter packing via `_ai_pack_units()` / `_ai_take_prefix()` — chapters
-<`_AI_MIN_AGGREGATE_TOKENS`=1K merge with the leading part of the next into requests
-≤`_AI_REWRITE_MAX_TOKENS`=8K, joined by `_AI_PART_MARKER` and split back, with a per-chapter
-fallback if the marker isn't preserved; yields each chapter as soon as all its pieces are rewritten
-so the caller can run TTS between AI requests) · `correct_phonetics_ai_chapters()` (eager
-`dict()` wrapper around the generator) ·
+chapter) · `_rewrite_packed_unit()` (one packed request) · `_iter_correct_phonetics_ai_pieces()`
+(internal generator the pipeline drives: same packing, but yields **every rewritten piece** as it
+comes back as `(chapter_index, piece, is_last_piece)`, so a long chapter can start being spoken
+after its first fragment instead of after all ~dozen of its units) · `iter_correct_phonetics_ai_chapters()`
+(public generator: wraps the piece generator and yields each chapter only once all its pieces are
+rewritten, joining them with `\n\n` — unchanged external contract) · `correct_phonetics_ai_chapters()`
+(eager `dict()` wrapper around the public generator) ·
 `check_phonetic_transcription_ai()` (check-only) · `_phonetic_rules_for(tts_engine,
 chatterbox_model)` selects `_PHONETIC_RULES` (Kokoro: inline IPA `[text](/kˈOkəɹO/)`, stress
 `(-1)`/`(+1)`, `[[espeak phonemes]]`) vs `_CHATTERBOX_PHONETIC_RULES` (plain-English respelling
@@ -229,15 +241,18 @@ tts_engine=None)`: loads spaCy + settings → resolves engine/model/style from s
 + metadata/cover → selects chapters → estimates ETA → for Chatterbox resolves the clone source
 (auto-builds the preset via Kokoro if missing) and opens one warm bridge → if AI is enabled, builds
 the list of chapters that still need synthesis (existing WAVs / <10-char chapters skipped first)
-and drives the lazy `iter_correct_phonetics_ai_chapters()` generator → per chapter: skips
-existing WAVs, skips <10 chars, applies the AI rewrite pulled for this chapter, prepends
-title/author to chapter 1, synthesizes (engine-specific), and only after the audio is written pulls
-the next AI request — so AI and TTS interleave AI→TTS→AI→TTS instead of all AI up front →
-concatenates, peak-normalizes to 0.708, writes WAV → builds the index + M4B → deletes WAVs →
-re-saves settings. Posts `CORE_STARTED` … `CORE_FINISHED`. The Chatterbox per-chapter synthesis is
+and drives the lazy `_iter_correct_phonetics_ai_pieces()` generator → per chapter: skips
+existing WAVs, skips <10 chars, and for a chapter with an AI rewrite pulls and **synthesizes each
+rewritten fragment in turn**, appending to that chapter's audio buffer, then writes the WAV when the
+chapter's last fragment arrives; the next `next()` after a fragment is spoken triggers the next
+Gemini request — so AI and TTS interleave AI→TTS→AI→TTS **inside** a long chapter too, instead of
+waiting for its whole rewrite (a 300K-char chapter is ~10 units) → prepends
+title/author to the first piece of chapter 1 → concatenates, peak-normalizes to 0.708, writes WAV →
+builds the index + M4B → deletes WAVs →
+re-saves settings. Posts `CORE_STARTED` … `CORE_FINISHED`. The Chatterbox per-fragment synthesis is
 wrapped in a retry loop (`chatterbox_max_retries = 3`): a `ChatterboxError` (dead/absent bridge,
 e.g. `BrokenPipeError` when the subprocess dies mid-chapter) closes the bridge, re-spawns it via
-`_recreate_chatterbox_bridge()` and re-synthesizes that chapter from scratch; `ChatterboxCancelled`
+`_recreate_chatterbox_bridge()` and re-synthesizes that fragment; `ChatterboxCancelled`
 is re-raised first for a clean `stop_event` stop, and once the retries are exhausted `CORE_ERROR`
 is posted and the run ends gracefully.
 
@@ -366,7 +381,8 @@ There is **no test suite** — verification is `py_compile`, import smoke checks
     acceptable in settings/UI paths.
 11. **Paths**: always `pathlib.Path`.
 12. **Chatterbox crashes are retried, not fatal — and the retry loop is import-sensitive.**
-    `pipeline.main` retries a failed chapter by recreating the bridge (`chatterbox_max_retries = 3`).
+    `pipeline.main` retries a failed fragment by recreating the bridge (`chatterbox_max_retries = 3`)
+    in the `_synthesize()` helper used for both AI fragments and whole chapters.
     Because `ChatterboxCancelled` subclasses `ChatterboxError`, the `except ChatterboxCancelled:
     raise` clause **must be listed before** `except ChatterboxError`. Both names therefore have to be
     imported into `pipeline.py`: a `raise`-less `except ChatterboxCancelled:` whose name is missing
@@ -396,6 +412,49 @@ There is **no test suite** — verification is `py_compile`, import smoke checks
 ---
 
 ## 10. Recent Changes
+
+- **2026-10-10 — Fragment-level AI/TTS interleaving (fixes "Gemini responds but no audio").**
+  The pipeline used to drive `iter_correct_phonetics_ai_chapters()`, which withholds a chapter until
+  **all** of its AI fragments are rewritten. A real ~300K-char chapter is split into ~10 units
+  (≤`_AI_REWRITE_MAX_CHARS`=32K), so the pipeline sat inside the very first `next()` — before the
+  synthesis loop even started — through 10 back-to-back Gemini round-trips, producing no audio
+  (and on the free tier that is many minutes of fallback/timeouts, so users Ctrl+C'd thinking it hung).
+  New internal generator `_iter_correct_phonetics_ai_pieces()` yields every piece as
+  `(chapter_index, piece, is_last_piece)`; `pipeline.main` now pulls and synthesizes each fragment in
+  turn, appending to the chapter's audio buffer and writing the WAV when its last fragment arrives, so
+  the next Gemini request is sent only after the previous fragment is spoken — the AI→TTS→AI→TTS
+  interleave now holds *inside* a long chapter too (first audio starts after 1 request, not ~10).
+  `iter_correct_phonetics_ai_chapters()` / `correct_phonetics_ai_chapters()` keep their old contract by
+  wrapping the piece generator. Verified offline with stubbed Gemini/TTS: public generator still yields
+  whole chapters (joined by `\n\n`); a 317K-char first chapter starts TTS before the 2nd AI request;
+  Kokoro path, existing-WAV skip, and a unit spanning two chapters (`X_last + Y_prefix`) all pass.
+  `py_compile` + import clean.
+
+- **2026-10-10 — 60s per-model timeout with live countdown.** `core/gemini.py` abandons a Gemini
+  model that produces no response within `_GEMINI_REQUEST_TIMEOUT_SECS`=60s and immediately tries the
+  next one. New `_call_gemini_with_timeout()` runs each call in a daemon worker thread and prints a
+  per-second `[Gemini] <model>: waiting for response, Ns left` countdown; on expiry it raises
+  `GeminiTimeoutError` (no non-retryable marker → retryable → failover). New `_gemini_client()`
+  builds `genai.Client` with `http_options=types.HttpOptions(timeout=60000)` so the hung HTTP request
+  is also aborted socket-side instead of lingering to the OS TCP timeout. Both `_try_gemini_models`
+  and `_call_gemini_with_retry` route through the watchdog, and both `_do_call` sites now use
+  `_gemini_client`. Verified offline: a 30s-hang func with `timeout=3` counted 3→2→1 and raised after
+  ~3.0s; a fast func returned instantly with no countdown; `_try_gemini_models` moved m1(→timeout)→m2
+  and returned on m2; `_gemini_client('AIzaTEST')._http_options.timeout == 45000`. `py_compile` +
+  import clean.
+
+- **2026-10-10 — Gemini model fallback, immediate failover + diagnostics.** `core/gemini.py` gained a
+  `GEMINI_MODELS` tuple (11 models, newest first) and `_try_gemini_models()`, the default path for
+  every public AI function (`use_model_fallback=True`). Each model is tried **once, immediately**: a
+  busy/unavailable (retryable, e.g. 503/429) model moves straight to the next with **no per-model
+  backoff** — the earlier wrapper applied `_call_gemini_with_retry` per model, so a 503 waited a full
+  minute before the next model was even tried. Only after **all** models fail does the whole list
+  wait the 1/2/3/4-minute schedule and retry (5 rounds total, so up to 55 calls). Permanent errors
+  (bad key, permissions, NOT_FOUND) are not model-specific and abort at once. Added `[Gemini] …`
+  diagnostics: each model attempt (`Trying model N/11: …`), each failure, each backoff round, and
+  the final give-up. Verified offline with a stubbed `func`: (a) 503 on every model → all 11 tried
+  in order with no wait, then 5 rounds / 55 calls, then raise; (b) 503 on models 1–2, success on
+  model 3 → returns immediately after 3 calls. `py_compile` + import clean.
 
 - **2026-10-09 — Chatterbox thread pinning.** `generate.py` (both the live
   `/home/vlad/chatterbox_venv` copy and the repo `chatterbox_bridge/` copy) now calls

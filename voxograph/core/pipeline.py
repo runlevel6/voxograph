@@ -26,7 +26,7 @@ from .utils import _clamp_float, _clamp_int, _clamp_unit_float, strfdelta, _inse
 from .settings import load_settings, save_settings, is_chatterbox_model
 from .nlp import get_nlp, lang_code_from_voice, set_espeak_library
 from .gemini import (
-    iter_correct_phonetics_ai_chapters, _sanitize_api_key,
+    _iter_correct_phonetics_ai_pieces, _sanitize_api_key,
     _AI_REWRITE_MAX_TOKENS, _AI_MIN_AGGREGATE_TOKENS,
 )
 from .epub import (
@@ -276,9 +276,11 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
     # AI first. Chapters with an existing WAV and <10-char chapters are skipped
     # here exactly as they are in the loop below, so resuming a run never
     # re-bills them. The AI rewrites are produced lazily, one packed request at
-    # a time, and each request is followed by the TTS of the chapter(s) it
-    # finished before the next request is sent — so AI and TTS interleave as
-    # AI -> TTS -> AI -> TTS, spreading the API calls out in time.
+    # a time, and each request is followed by the TTS of the rewritten piece it
+    # just produced before the next request is sent — so AI and TTS interleave
+    # as AI -> TTS -> AI -> TTS. Pieces (not whole chapters) are yielded, so a
+    # long chapter starts being spoken after its first fragment instead of
+    # after every one of its ~dozen fragments has been rewritten.
     pending_ai = []
     if ai_enabled:
         for i, chapter in enumerate(selected_chapters, start=1):
@@ -296,16 +298,47 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                   f'{_AI_MIN_AGGREGATE_TOKENS:,} tokens merge with the next). Each '
                   f'request is sent only after the previous chapter\'s TTS finishes.')
 
-    ai_rewrites = (
-        iter_correct_phonetics_ai_chapters(
+    ai_pieces = (
+        _iter_correct_phonetics_ai_pieces(
             pending_ai, ai_api_key, model=ai_model, stop_event=stop_event,
             post_event=post_event, tts_engine=tts_engine,
             chatterbox_model=chatterbox_model,
             chapter_total=len(selected_chapters))
         if pending_ai else iter(()))
-    # First request goes out now; its chapter is synthesized before the next
+    # First request goes out now; its piece is synthesized before the next
     # request is pulled from the generator (see the advance at the loop tail).
-    next_ai = next(ai_rewrites, None)
+    next_ai = next(ai_pieces, None)
+
+    def _synthesize(piece_text):
+        """Synthesize one piece of text, returning (segments, sample_rate).
+
+        For Chatterbox, a bridge crash is retried by recreating the bridge;
+        returns (None, None) once every retry is exhausted (after posting
+        CORE_ERROR) so the caller can stop the run.
+        """
+        if tts_engine == 'chatterbox':
+            retries = 0
+            while retries <= chatterbox_max_retries:
+                try:
+                    return gen_audio_segments_chatterbox(
+                        bridge, piece_text, stats=stats, post_event=post_event,
+                        max_chunks=max_sentences, stop_event=stop_event)
+                except ChatterboxCancelled:
+                    raise
+                except ChatterboxError as e:
+                    retries += 1
+                    if retries > chatterbox_max_retries:
+                        print(f'\033[91mChatterbox generation failed after {chatterbox_max_retries} retries: {e}\033[0m')
+                        if post_event:
+                            post_event('CORE_ERROR', message=f'Chatterbox generation failed after {chatterbox_max_retries} retries: {e}')
+                        return None, None
+                    print(f'\033[93mChatterbox error (attempt {retries}/{chatterbox_max_retries}): {e}. Recreating bridge...\033[0m')
+                    _recreate_chatterbox_bridge()
+            return None, None
+        segments = gen_audio_segments(
+            pipeline, piece_text, voice, speed, stats,
+            post_event=post_event, max_sentences=max_sentences, stop_event=stop_event)
+        return segments, sample_rate
 
     chapter_wav_files = []
     try:
@@ -333,47 +366,50 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                 stats.processed_chars += len(text)
                 continue
 
-            ai_applied = False
-            if next_ai is not None and next_ai[0] == chapter.chapter_index:
-                text = next_ai[1]
-                ai_applied = True
-            if stop_event and stop_event.is_set():
-                print('Synthesis stopped by user during AI rewrite.')
-                break
-            if i == 1:
-                text = f'{title} – {creator}.\n\n' + text
-
             start_time = time.time()
             if post_event:
                 post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
 
-            if tts_engine == 'chatterbox':
-                retries = 0
-                while retries <= chatterbox_max_retries:
-                    try:
-                        audio_segments, write_sample_rate = gen_audio_segments_chatterbox(
-                            bridge, text, stats=stats, post_event=post_event,
-                            max_chunks=max_sentences, stop_event=stop_event)
+            audio_segments = []
+            write_sample_rate = sample_rate
+            if next_ai is not None and next_ai[0] == chapter.chapter_index:
+                # AI chapter: synthesize fragment by fragment. Pulling the next
+                # piece after a fragment has been spoken triggers the next
+                # Gemini request, so AI and TTS interleave even inside one long
+                # chapter instead of blocking on the whole chapter's rewrite.
+                first_piece = True
+                while next_ai is not None and next_ai[0] == chapter.chapter_index:
+                    if stop_event and stop_event.is_set():
+                        print('Synthesis stopped by user during AI rewrite.')
                         break
-                    except ChatterboxCancelled:
-                        raise
-                    except ChatterboxError as e:
-                        retries += 1
-                        if retries > chatterbox_max_retries:
-                            print(f'\033[91mChatterbox generation failed after {chatterbox_max_retries} retries: {e}\033[0m')
-                            if post_event:
-                                post_event('CORE_ERROR', message=f'Chatterbox generation failed after {chatterbox_max_retries} retries: {e}')
-                            audio_segments = None
-                            break
-                        print(f'\033[93mChatterbox error (attempt {retries}/{chatterbox_max_retries}): {e}. Recreating bridge...\033[0m')
-                        _recreate_chatterbox_bridge()
+                    piece_text = next_ai[1]
+                    if i == 1 and first_piece:
+                        piece_text = f'{title} – {creator}.\n\n' + piece_text
+                    segments, piece_sr = _synthesize(piece_text)
+                    if segments is None:
+                        audio_segments = None
+                        break
+                    if piece_sr:
+                        write_sample_rate = piece_sr
+                    audio_segments.extend(segments)
+                    first_piece = False
+                    is_last = next_ai[2]
+                    if stop_event and stop_event.is_set():
+                        print('Synthesis stopped by user during AI rewrite.')
+                        audio_segments = None
+                        break
+                    next_ai = next(ai_pieces, None)
+                    if is_last:
+                        break
                 if audio_segments is None:
                     break
             else:
-                audio_segments = gen_audio_segments(
-                    pipeline, text, voice, speed, stats,
-                    post_event=post_event, max_sentences=max_sentences, stop_event=stop_event)
-                write_sample_rate = sample_rate
+                if i == 1:
+                    text = f'{title} – {creator}.\n\n' + text
+                segments, write_sample_rate = _synthesize(text)
+                if segments is None:
+                    break
+                audio_segments = segments
 
             if audio_segments:
                 audio_segments = _insert_silence_between(audio_segments, CHUNK_SILENCE_MS)
@@ -398,12 +434,6 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
             else:
                 print(f'Warning: No audio generated for chapter {i}')
                 chapter_wav_files.remove(chapter_wav_path)
-
-            # Only now — after this chapter's audio is done — do we ask the
-            # generator for the next rewrite. That pulls the next packed AI
-            # request, so the next Gemini call is sent after TTS, not before.
-            if ai_applied:
-                next_ai = next(ai_rewrites, None)
     finally:
         if bridge is not None:
             bridge.close()
