@@ -11,6 +11,24 @@ from pick import pick
 from .text import clean_text
 
 
+def _element_own_text(element, content_tags):
+    """Text owned by `element`, excluding text inside any nested content tag.
+
+    `find_all` returns nested matches too, and a parent's `.text` already
+    includes its descendants, so appending `.text` for every match duplicates
+    any text under a nested content tag (e.g. an outer `<p>` that wraps a
+    whole chapter, or `<li><p>...</p></li>`). A nested tag is emitted on its
+    own, so this keeps only the strings whose nearest content-tag ancestor is
+    `element`, which preserves the paragraph/heading structure exactly once.
+    Comments are excluded, matching `Tag.text`.
+    """
+    return ''.join(
+        str(string)
+        for string in element.strings
+        if string.find_parent(content_tags) is element
+    )
+
+
 def find_cover(book):
     def is_image(item):
         return item is not None and item.media_type.startswith('image/')
@@ -62,10 +80,16 @@ def find_document_chapters_and_extract_texts(book, ai_enabled=False):
         soup = BeautifulSoup(xml, features='lxml')
         chapter.extracted_text = ''
         html_content_tags = ['title', 'p', 'h1', 'h2', 'h3', 'h4', 'li']
-        for text in [c.text.strip() for c in soup.find_all(html_content_tags) if c.text]:
+        for element in soup.find_all(html_content_tags):
+            # Use only this element's own text: find_all returns nested matches
+            # (and a parent's .text already contains its descendants), so using
+            # .text here duplicated every nested paragraph/list item.
+            text = _element_own_text(element, html_content_tags).strip()
+            if not text:
+                continue
             # fix #2: only append a period when the sentence doesn't already
             # end with terminal punctuation (., ?, !)
-            if text and text[-1] not in '.?!':
+            if text[-1] not in '.?!':
                 text += '.'
             chapter.extracted_text += text + '\n'
 

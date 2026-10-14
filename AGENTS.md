@@ -178,7 +178,9 @@ re-exported from here.
 
 **`epub.py`** — `find_cover()` (ITEM_COVER → OPF meta → id="cover" → filename) ·
 `find_document_chapters_and_extract_texts(book, ai_enabled=False)` (spine order, BeautifulSoup +
-lxml over `title/p/h1-h4/li`, Fix #2, applies `clean_text`) · `is_chapter()` · `find_good_chapters()`
+lxml over `title/p/h1-h4/li`, **each element's own text only** via `_element_own_text()` so nested
+content tags are emitted once instead of the parent's `.text` duplicating them, Fix #2, applies
+`clean_text`) · `is_chapter()` · `find_good_chapters()`
 · `pick_chapters()` · `print_selected_chapters()` · `chapter_beginning_one_liner()`.
 
 **`gemini.py`** (839 lines) — its constants and rule strings live in `constants.py`; the module
@@ -432,6 +434,17 @@ There is **no test suite** — verification is `py_compile`, import smoke checks
 
 ## 10. Recent Changes
 
+- **2026-10-14 — EPUB extraction no longer duplicates nested content ("sentences repeated").**
+  `core/epub.py::find_document_chapters_and_extract_texts` appended `c.text` for every
+  `soup.find_all(['title','p','h1-h4','li'])` match, but `find_all` returns nested matches and a
+  parent's `.text` already contains its descendants — so any nested content tag (`<li><p>…</p></li>`,
+  nested lists, or an outer `<p>` wrapping a whole chapter) was emitted **twice**. New helper
+  `_element_own_text(element, content_tags)` keeps only the strings whose nearest content-tag
+  ancestor is `element`, so each is emitted once while paragraph/heading structure is preserved
+  (period rule unchanged). Measured on `/home/vlad/Downloads`: *A Window to Heaven* (each chapter
+  wrapped in an outer `<p>`) dropped 495,182 chars (~half the book); *Act of Oblivion* −1,218;
+  *A Cowboy for Keeps* TOC −10; the other 12 books were byte-identical (no regression). `compileall`
+  + import clean. (Chatterbox Turbo's own intermittent token-looping is a separate model behavior.)
 - **2026-10-11 — `v1.1.0` release.** Version bumped to `1.1.0` in `pyproject.toml` and the
   memory bank (§1, §2, §9). This tag is the current working tree: the UI package port, the
   Chatterbox Turbo/tag/bridge changes, the bridge-retry logic, and the Gemini/TTS overlap work
