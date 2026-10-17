@@ -260,7 +260,7 @@ _NON_RETRYABLE_ERROR_MARKERS = ('NOT_FOUND', 'PERMISSION_DENIED', 'INVALID_ARGUM
 # built with the same HTTP timeout (HttpOptions.timeout is in milliseconds)
 # so the hung request is actually aborted on the client side rather than
 # lingering until the OS-level TCP timeout.
-_GEMINI_REQUEST_TIMEOUT_SECS = 120
+_GEMINI_REQUEST_TIMEOUT_SECS = 180
 _GEMINI_REQUEST_TIMEOUT_MS = _GEMINI_REQUEST_TIMEOUT_SECS * 1000
 
 # Ordered list of Gemini models to try sequentially until one succeeds.
