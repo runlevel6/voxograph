@@ -100,6 +100,13 @@ def _popen_run(args, stop_event=None, on_stderr_line=None, **kwargs):
     return proc
 
 
+def _encode_progress_bar(fraction, speed, eta, width=40):
+    """Render one ffmpeg encode progress line, updated in place via carriage return."""
+    filled = int(width * fraction)
+    bar = '█' * filled + '░' * (width - filled)
+    return f'\rEncoding: [{bar}] {fraction*100:5.1f}% | speed={speed}x | ETA {eta}'
+
+
 def create_m4b(chapter_files, filename, cover_image, output_folder, chapters_txt_path,
                total_audio_secs=0, stats=None, post_event=None, stop_event=None):
     """Encode chapter WAVs directly to M4B in a single ffmpeg pass.
@@ -115,6 +122,9 @@ def create_m4b(chapter_files, filename, cover_image, output_folder, chapters_txt
     (rather than each function independently hardcoding the same filename)
     so the two functions can't drift out of sync, and so the path can be
     made unique per-run (see create_index_file).
+
+    Returns True only when ffmpeg finished successfully and the M4B exists,
+    so callers can avoid deleting the source WAVs after a failed encode.
     """
     m4b_name = filename.replace('.epub', '.m4b')
     m4b_dir = Path(output_folder) / Path(m4b_name).stem
@@ -184,11 +194,15 @@ def create_m4b(chapter_files, filename, cover_image, output_folder, chapters_txt
             speed = float(speed_m.group(1))
             remaining_secs = max(total_audio_secs - encoded_secs, 0) / speed if speed > 0 else 0
             stats.eta = strfdelta(remaining_secs)
-            print(f'Encoding: {fraction*100:.1f}% | speed={speed}x | ETA {stats.eta}')
+            bar_line = _encode_progress_bar(fraction, speed, stats.eta)
+            if fraction >= 1.0:
+                bar_line += '\n'
+            print(bar_line, end='', flush=True)
         post_event('CORE_PROGRESS', stats=stats)
 
+    encoded = False
     try:
-        # Fix: reuse the shared _popen_run helper (stop_event handling +
+        # Reuse the shared _popen_run helper (stop_event handling +
         # non-blocking pipe draining) instead of duplicating that logic
         # inline, so there's a single implementation to maintain.
         proc = _popen_run(
@@ -200,6 +214,7 @@ def create_m4b(chapter_files, filename, cover_image, output_folder, chapters_txt
             text=True,
         )
         if proc.returncode == 0:
+            encoded = True
             print(f'{final_filename} created. Enjoy your audiobook.')
         else:
             print(f"Error creating M4B file. FFmpeg returned code: {proc.returncode}")
@@ -213,6 +228,7 @@ def create_m4b(chapter_files, filename, cover_image, output_folder, chapters_txt
             cover_file_path.unlink()
         if Path(chapters_txt_path).exists():
             Path(chapters_txt_path).unlink()
+    return encoded
 
 
 def probe_duration(file_name):

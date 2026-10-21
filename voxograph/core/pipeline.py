@@ -490,16 +490,22 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                 post_event('CORE_ERROR', message='No audio was generated for any chapter.')
         else:
             total_audio_secs, chapters_txt_path = create_index_file(title, creator, chapter_wav_files, output_folder)
-            create_m4b(chapter_wav_files, filename, cover_image, output_folder,
-                       chapters_txt_path=chapters_txt_path,
-                       total_audio_secs=total_audio_secs, stats=stats,
-                       post_event=post_event, stop_event=stop_event)
-            delete_wav_files(chapter_wav_files)
-            if post_event:
-                stats.progress = 100
-                stats.eta = strfdelta(0)
-                post_event('CORE_PROGRESS', stats=stats)
-                post_event('CORE_FINISHED')
+            m4b_created = create_m4b(chapter_wav_files, filename, cover_image, output_folder,
+                                     chapters_txt_path=chapters_txt_path,
+                                     total_audio_secs=total_audio_secs, stats=stats,
+                                     post_event=post_event, stop_event=stop_event)
+            if m4b_created:
+                delete_wav_files(chapter_wav_files)
+                if post_event:
+                    stats.progress = 100
+                    stats.eta = strfdelta(0)
+                    post_event('CORE_PROGRESS', stats=stats)
+                    post_event('CORE_FINISHED')
+            else:
+                print('\033[93mM4B creation failed — keeping the chapter WAV files so the '
+                      'encode can be retried.\033[0m')
+                if post_event:
+                    post_event('CORE_ERROR', message='M4B creation failed. Chapter WAV files were kept.')
 
     settings = load_settings()
     save_settings(
