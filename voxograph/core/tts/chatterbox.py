@@ -4,6 +4,7 @@
 import tempfile
 from queue import Queue, Empty
 import json
+import os
 import soundfile
 import numpy as np
 import time
@@ -16,6 +17,7 @@ from ..constants import (
     CHATTERBOX_BRIDGE_DIR, CHATTERBOX_BRIDGE_PYTHON, CHATTERBOX_BRIDGE_SCRIPT,
     CHATTERBOX_DEFAULT_EXAGGERATION, CHATTERBOX_DEFAULT_CFG_WEIGHT,
     CHATTERBOX_DEFAULT_MODEL, CHATTERBOX_LANGUAGE_ID, CHATTERBOX_T3_MODEL,
+    CHATTERBOX_CUDA_ALLOC_CONF,
     _CHATTERBOX_NOISE_MARKERS, sample_rate,
     CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, CHATTERBOX_TURBO_DEFAULT_TOP_P,
     CHATTERBOX_TURBO_DEFAULT_TOP_K, CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY,
@@ -121,10 +123,18 @@ class ChatterboxBridge:
             raise ChatterboxError(f'Chatterbox bridge script not found: {self.script}')
 
         self._responses = Queue()
+        # The Turbo model (~6.9 GB) nearly fills the 8 GB Quadro P4000, so the
+        # default (non-expandable) CUDA allocator fragments under repeated
+        # generate() calls and the subprocess dies with OOM. PyTorch's
+        # expandable-segments allocator grows segments on demand and never
+        # leaves holes behind, keeping the footprint contiguous. Inherit the
+        # parent env so the user can override it, then set the value.
+        bridge_env = dict(os.environ)
+        bridge_env['PYTORCH_CUDA_ALLOC_CONF'] = CHATTERBOX_CUDA_ALLOC_CONF
         self.proc = subprocess.Popen(
             [str(self.python), str(self.script), '--serve'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding='utf-8', bufsize=1)
+            text=True, encoding='utf-8', bufsize=1, env=bridge_env)
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         threading.Thread(target=self._read_responses, daemon=True).start()
 
@@ -292,8 +302,9 @@ def gen_audio_segments_chatterbox(bridge, text, stats=None, max_chunks=None,
                 stats.eta = strfdelta(remaining_tts + remaining_encode)
                 if post_event:
                     post_event('CORE_PROGRESS', stats=stats)
-                print(f'Chatterbox chunk {idx}/{len(chunks)} — '
-                      f'{stats.progress}% (ETA {stats.eta})')
+                print(f'\rChatterbox chunk {idx}/{len(chunks)} — '
+                      f'{stats.progress}% (ETA {stats.eta})', end='', flush=True)
+        print()  # End the line after all chunks are done
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     return segments, write_sr

@@ -135,7 +135,15 @@ CHATTERBOX_BRIDGE_PYTHON = CHATTERBOX_BRIDGE_DIR / 'bin' / 'python3'
 CHATTERBOX_BRIDGE_SCRIPT = CHATTERBOX_BRIDGE_DIR / 'generate.py'
 CHATTERBOX_T3_MODEL = 't3_mtl23ls_v3.safetensors'
 CHATTERBOX_LANGUAGE_ID = 'en'
-_CHATTERBOX_NOISE_MARKERS = ('it/s', '?it/s', 'Sampling:', 'Fetching', '%|')
+
+# The Turbo model (~6.9 GB) nearly fills the 8 GB Quadro P4000, so any CUDA
+# allocator fragmentation pushes it over the edge with OOM. PyTorch's
+# expandable-segments allocator grows segments on demand and never leaves
+# holes behind, which keeps the ~6.9 GB footprint contiguous and avoids the
+# OOM that a default (non-expandable) allocator causes once the card is full.
+# Set on every Chatterbox subprocess (both one-shot preview and --serve).
+CHATTERBOX_CUDA_ALLOC_CONF = 'expandable_segments:True'
+_CHATTERBOX_NOISE_MARKERS = ('it/s', '?it/s', 'Sampling:', 'Fetching', '%|', 'S3 Token', 'Mel Inference', 'Mel -> Wav')
 
 # Sentence/clause boundaries used by the Chatterbox chunker.
 _SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?\u2026])\s+')
@@ -252,7 +260,27 @@ _GEMINI_RETRY_DELAYS_SECS = [60, 120, 180, 240]
 # Errors in this set are permanent (bad model name, bad key, no permission)
 # and will never succeed no matter how many times we retry, so we bail out
 # immediately instead of making the caller wait up to 10 minutes for nothing.
-_NON_RETRYABLE_ERROR_MARKERS = ('NOT_FOUND', 'PERMISSION_DENIED', 'INVALID_ARGUMENT', 'UNAUTHENTICATED')
+# Quota errors deliberately stay OUT of this set: Gemini's free-tier daily
+# quota is enforced per model (QuotaFailure quotaId
+# `GenerateRequestsPerDayPerProjectPerModel-FreeTier` with a `model` dimension),
+# so one exhausted model must not stop the fallback from trying the others.
+_NON_RETRYABLE_ERROR_MARKERS = (
+    'NOT_FOUND',
+    'PERMISSION_DENIED',
+    'INVALID_ARGUMENT',
+    'UNAUTHENTICATED',
+)
+
+# A quota-exhausted model is a dead end only for that model. The fallback loop
+# skips it immediately (a 1-minute retry cannot help), tries the remaining
+# models, and gives up only when every model is out of daily quota.
+_QUOTA_ERROR_MARKERS = ('RESOURCE_EXHAUSTED', 'quota exceeded', 'QuotaFailure')
+
+# Markers that identify a *daily* quota (quota resets in hours, so the normal
+# 1/2/3/4-minute backoff rounds are pointless). Fallback also treats an API
+# `retryDelay` longer than _QUOTA_DAILY_RETRY_DELAY_SECS as daily.
+_DAILY_QUOTA_ERROR_MARKERS = ('PerDay', 'per day', 'per_day')
+_QUOTA_DAILY_RETRY_DELAY_SECS = 600
 
 # Hard ceiling on a single Gemini request. A watchdog thread prints a live
 # countdown while the call is in flight; if no response arrives in this window
@@ -389,8 +417,8 @@ _CHATTERBOX_TAG_RULES = (
 
 # Rough char-to-token ratio used to size Gemini requests for the
 # phonetic rewriter. ~4 chars/token is a defensible average for English
-# prose, so 8K tokens ~= 32K characters of payload per request.
-_AI_REWRITE_MAX_TOKENS = 8_000
+# prose, so 15K tokens ~= 60K characters of payload per request.
+_AI_REWRITE_MAX_TOKENS = 15_000
 _AI_REWRITE_CHARS_PER_TOKEN = 4
 _AI_REWRITE_MAX_CHARS = _AI_REWRITE_MAX_TOKENS * _AI_REWRITE_CHARS_PER_TOKEN
 

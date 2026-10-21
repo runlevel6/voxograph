@@ -2,6 +2,7 @@
 
 
 import math
+import re
 import threading
 import time
 from google import genai
@@ -14,14 +15,24 @@ from .constants import (
     _AI_PART_JOIN, _AI_PART_MARKER, _AI_REWRITE_CHARS_PER_TOKEN,
     _AI_REWRITE_MAX_CHARS, _AI_REWRITE_MAX_TOKENS, _AI_SENTENCE_BREAK_RE,
     _CHATTERBOX_PHONETIC_RULES, _CHATTERBOX_TAG_RULES,
-    _GEMINI_REQUEST_TIMEOUT_MS, _GEMINI_REQUEST_TIMEOUT_SECS, _GEMINI_RETRY_DELAYS_SECS,
-    _NON_RETRYABLE_ERROR_MARKERS, _PHONETIC_RULES,
+    _DAILY_QUOTA_ERROR_MARKERS, _GEMINI_REQUEST_TIMEOUT_MS,
+    _GEMINI_REQUEST_TIMEOUT_SECS, _GEMINI_RETRY_DELAYS_SECS,
+    _NON_RETRYABLE_ERROR_MARKERS, _PHONETIC_RULES, _QUOTA_DAILY_RETRY_DELAY_SECS,
+    _QUOTA_ERROR_MARKERS,
 )
 
 
 def _ai_generate_config():
     """Build the generation config shared by every Gemini call in this module."""
-    return types.GenerateContentConfig(max_output_tokens=_AI_MAX_OUTPUT_TOKENS)
+    return types.GenerateContentConfig(
+        max_output_tokens=_AI_MAX_OUTPUT_TOKENS,
+        # These calls declare no tools, so AFC has nothing to execute. Without
+        # this the SDK still runs its AFC wrapper and logs a multi-line
+        # "Direct use of automatic function calling (AFC) ..." warning before
+        # the first request. Disabling it keeps the request path plain and the
+        # console clean (the code never uses tools, so no Chat session needed).
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +135,32 @@ def _call_gemini_with_timeout(func, *args, timeout=_GEMINI_REQUEST_TIMEOUT_SECS,
     return outcome['value']
 
 
+_QUOTA_RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
+
+
+def _is_daily_quota_error(exc) -> bool:
+    """True when the model has exhausted its *daily* quota.
+
+    Gemini reports this as RESOURCE_EXHAUSTED with a QuotaFailure whose quotaId
+    is per-model (``GenerateRequestsPerDayPerProjectPerModel-FreeTier``) and a
+    ``retryDelay`` measured in hours. Such a model is useless for this run, but
+    other models keep their own quota, so the caller should skip it and move on
+    instead of aborting the whole fallback.
+    """
+    msg = str(exc)
+    if not any(marker in msg for marker in _QUOTA_ERROR_MARKERS):
+        return False
+    if any(marker in msg for marker in _DAILY_QUOTA_ERROR_MARKERS):
+        return True
+    match = _QUOTA_RETRY_DELAY_RE.search(msg)
+    if match:
+        try:
+            return float(match.group(1)) > _QUOTA_DAILY_RETRY_DELAY_SECS
+        except ValueError:
+            return False
+    return False
+
+
 def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
     """
     Try calling func(model, *args, **kwargs) with each model in GEMINI_MODELS
@@ -133,43 +170,73 @@ def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
     503) waits 1 minute and retries the SAME model once before moving on — a
     demand spike is usually temporary and the first model is often still the
     best bet. A model that produces no response within
-    _GEMINI_REQUEST_TIMEOUT_SECS (60s) is abandoned and the next model is
-    tried. Only when EVERY model fails in a pass does the whole list wait a
-    backoff delay and get retried (1, 2, 3, then 4 minutes); after the last
-    round the final exception is raised.
+    _GEMINI_REQUEST_TIMEOUT_SECS is abandoned and the next model is tried.
+    Only when EVERY model fails in a pass does the whole list wait a backoff
+    delay and get retried (1, 2, 3, then 4 minutes); after the last round the
+    final exception is raised.
+
+    Daily-quota errors are model-specific (Gemini's free tier is limited per
+    model). An exhausted model is marked for the rest of the run and every
+    subsequent request skips it outright instead of burning a full
+    _GEMINI_REQUEST_TIMEOUT_SECS wait to rediscover it — the logs showed the
+    same model being tried on every chapter request. The remaining models are
+    still tried. If every model in a pass is out of daily quota, the run gives
+    up at once instead of waiting for a reset that is hours away.
 
     Permanent errors (bad key, permission denied, invalid argument) are not
     model-specific, so they abort immediately without trying other models.
     """
     last_exc = None
     total_rounds = len(_GEMINI_RETRY_DELAYS_SECS) + 1
+    give_up_for_quota = False
     for round_index in range(total_rounds):
         if round_index > 0:
             print(f'\033[96m[Gemini] Retry round {round_index}/{total_rounds - 1} '
                   f'(all {len(GEMINI_MODELS)} models)\033[0m')
+        failed_models = 0
+        quota_models = 0
+        available = [m for m in GEMINI_MODELS if not _is_exhausted(m)]
+        if not available:
+            give_up_for_quota = True
+            print('\033[91m[Gemini] Every model is out of daily quota. '
+                  'Not waiting for a reset that is hours away.\033[0m')
+            break
         for i, model in enumerate(GEMINI_MODELS):
             if stop_event and stop_event.is_set():
                 if last_exc:
                     raise last_exc
                 raise RuntimeError('Stopped by user.')
+            if _is_exhausted(model):
+                continue
             print(f'\033[96m[Gemini] Trying model {i+1}/{len(GEMINI_MODELS)}: {model}\033[0m')
             try:
                 return _call_gemini_with_timeout(func, model, *args,
                                                  stop_event=stop_event, label=model, **kwargs)
             except GeminiTimeoutError as e:
                 last_exc = e
+                failed_models += 1
                 print(f'\033[93m[Gemini] Model {model} gave no response within '
                       f'{_GEMINI_REQUEST_TIMEOUT_SECS}s. Trying next model...\033[0m')
                 continue
             except Exception as e:
                 last_exc = e
+                failed_models += 1
                 if stop_event and stop_event.is_set():
                     raise
                 # Permanent error: not model-specific, so no point trying others.
                 if not _is_retryable_gemini_error(e):
                     print(f'\033[91m[Gemini] Model {model} failed with non-retryable error: {e}\033[0m')
-                    print('\033[91m[Gemini] Stopping model fallback (error likely not model-specific)\033[0m')
+                    print('\033[91m[Gemini] Stopping model fallback (error is not model-specific)\033[0m')
                     raise
+                # Daily quota is enforced per model: skip this one for the rest
+                # of the run (a 1-minute retry cannot help) and keep the
+                # fallback going — never re-try it on the next request.
+                if _is_daily_quota_error(e):
+                    _mark_exhausted(model)
+                    quota_models += 1
+                    print(f'\033[93m[Gemini] Model {model} is out of daily quota. '
+                          f'Trying next model...\033[0m')
+                    continue
                 # Busy/unavailable (e.g. 503): wait 1 minute and retry the
                 # SAME model once — a demand spike is usually temporary and
                 # the first model is often still the best bet. If the retry
@@ -192,10 +259,21 @@ def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
                         print(f'\033[91m[Gemini] Model {model} retry failed with '
                               f'non-retryable error: {retry_exc}\033[0m')
                         print('\033[91m[Gemini] Stopping model fallback '
-                              '(error likely not model-specific)\033[0m')
+                              '(error is not model-specific)\033[0m')
                         raise
+                    if _is_daily_quota_error(retry_exc):
+                        _mark_exhausted(model)
+                        quota_models += 1
+                        print(f'\033[93m[Gemini] Model {model} is out of daily quota. '
+                              f'Trying next model...\033[0m')
+                        continue
                     print(f'\033[93m[Gemini] Model {model} retry also failed: '
                           f'{retry_exc}. Trying next model...\033[0m')
+        if failed_models and quota_models == failed_models:
+            give_up_for_quota = True
+            print('\033[91m[Gemini] Every model is out of daily quota. '
+                  'Not waiting for a reset that is hours away.\033[0m')
+            break
         if round_index < len(_GEMINI_RETRY_DELAYS_SECS):
             delay = _GEMINI_RETRY_DELAYS_SECS[round_index]
             print(f'\033[93m[Gemini] All {len(GEMINI_MODELS)} models failed. Waiting '
@@ -204,9 +282,28 @@ def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
             _sleep_with_stop_event(delay, stop_event)
     if post_event and last_exc and _is_retryable_gemini_error(last_exc):
         post_event('CORE_AI_RETRY_EXHAUSTED', message=f'All models failed. Last error: {last_exc}')
-    print(f'\033[91m[Gemini] All {len(GEMINI_MODELS)} models failed across '
-          f'{total_rounds} round(s). Giving up.\033[0m')
+    if not give_up_for_quota:
+        print(f'\033[91m[Gemini] All {len(GEMINI_MODELS)} models failed across '
+              f'{total_rounds} round(s). Giving up.\033[0m')
     raise last_exc
+
+
+# Models known to be out of daily quota during THIS run. Once a model reports
+# a daily-quota error it is useless for the rest of the run (the free-tier
+# quota is per model per day), so every subsequent request skips it outright
+# instead of burning an _GEMINI_REQUEST_TIMEOUT_SECS wait to rediscover it.
+_EXHAUSTED_MODELS = set()
+_EXHAUSTED_MODELS_LOCK = threading.Lock()
+
+
+def _is_exhausted(model):
+    with _EXHAUSTED_MODELS_LOCK:
+        return model in _EXHAUSTED_MODELS
+
+
+def _mark_exhausted(model):
+    with _EXHAUSTED_MODELS_LOCK:
+        _EXHAUSTED_MODELS.add(model)
 
 
 def _is_retryable_gemini_error(exc) -> bool:
@@ -231,8 +328,9 @@ def _call_gemini_with_retry(func, *args, stop_event=None, post_event=None, **kwa
     Call func(*args, **kwargs), retrying on failure with an increasing
     backoff of 1, 2, 3, then 4 minutes (4 retries / 5 attempts total).
     Permanent-looking errors (invalid model, bad key, permission denied)
-    are not retried. If stop_event fires during a backoff wait, the last
-    exception is raised immediately.
+    are not retried, and neither is a daily-quota error: its reset is hours
+    away, so the backoff schedule cannot outlast it. If stop_event fires
+    during a backoff wait, the last exception is raised immediately.
 
     Returns func's return value on success, or raises the last exception
     once attempts are exhausted. If post_event is provided, it is called
@@ -252,6 +350,9 @@ def _call_gemini_with_retry(func, *args, stop_event=None, post_event=None, **kwa
             return _call_gemini_with_timeout(func, *args, stop_event=stop_event, **kwargs)
         except Exception as e:
             last_exc = e
+            if _is_daily_quota_error(e):
+                print('\033[91m[Gemini] Daily quota exhausted; not retrying.\033[0m')
+                break
             more_attempts_left = attempt < len(_GEMINI_RETRY_DELAYS_SECS)
             if more_attempts_left and _is_retryable_gemini_error(e):
                 delay = _GEMINI_RETRY_DELAYS_SECS[attempt]

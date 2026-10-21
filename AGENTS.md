@@ -186,15 +186,18 @@ content tags are emitted once instead of the parent's `.text` duplicating them, 
 **`gemini.py`** (839 lines) — its constants and rule strings live in `constants.py`; the module
 holds the retry/rewrite logic. `GEMINI_MODELS` (11 models newest-first) + `_try_gemini_models()`,
 the default fallback path (`use_model_fallback=True` on every public AI entry point): each model is
-tried **once immediately** — a busy/unavailable (retryable) model moves straight to the next with no
-per-model backoff — and only when **all** models fail does the whole list wait the backoff schedule
-(1/2/3/4 min) and retry (5 rounds). Non-retryable errors (bad key, permission, NOT_FOUND) abort at
+tried in turn — a daily-quota-exhausted model is skipped **immediately** (the free-tier quota is
+enforced per model, so the remaining models are still tried; if every model is out of daily quota the
+run gives up at once instead of waiting for a reset hours away), while any other busy/unavailable
+model (e.g. 503) waits 1 minute and is retried once before the next model is tried. Only when **all**
+models fail a pass does the whole list wait the backoff schedule (1/2/3/4 min) and retry (5 rounds).
+Non-retryable errors (bad key, permission, NOT_FOUND, UNAUTHENTICATED, INVALID_ARGUMENT) abort at
 once, since they are not model-specific. A model that produces no response within
-`_GEMINI_REQUEST_TIMEOUT_SECS`=120s is abandoned (`GeminiTimeoutError`, which has no non-retryable
+`_GEMINI_REQUEST_TIMEOUT_SECS`=180s is abandoned (`GeminiTimeoutError`, which has no non-retryable
 marker so it fails over) and the next model is tried · `_call_gemini_with_timeout()` runs each call
 in a daemon worker thread, prints a per-second `[Gemini] <model>: waiting for response, Ns left`
 countdown, and raises on expiry; `_gemini_client()` builds the SDK client with
-`http_options=types.HttpOptions(timeout=_GEMINI_REQUEST_TIMEOUT_MS=120000)` so a hung request is
+`http_options=types.HttpOptions(timeout=_GEMINI_REQUEST_TIMEOUT_MS=180000)` so a hung request is
 aborted socket-side too. Prints `[Gemini] …` diagnostics for each attempt/failure/timeout/round ·
 `_call_gemini_with_retry()` (still used when `use_model_fallback=False`: waits a minute on
 503/high-demand, posts `CORE_AI_RETRY_EXHAUSTED` when it gives up) · every `generate_content` call passes
@@ -218,7 +221,8 @@ pronunciation + tag insertion; Multilingual V3 gets no tag rules · `_is_retryab
 
 **`audio.py`** — `_popen_run(args, stop_event, on_stderr_line)` — interruptible `subprocess.run`
 with drain threads (avoids the 64 KB pipe-buffer deadlock) · `create_m4b()` (concat demuxer,
-64k mono AAC, `chapters.txt` metadata, real-time `speed=Nx` progress, temp cleanup in `finally`) ·
+64k mono AAC, `chapters.txt` metadata, real-time `speed=Nx` progress, temp cleanup in `finally`;
+returns `True` only when the encode succeeded — `pipeline.main` keeps the WAVs otherwise) ·
 `create_index_file()` (FFMETADATA1 chapters, TIMEBASE=1/1000) · `probe_duration()` (ffprobe) ·
 `delete_wav_files()`.
 
@@ -434,6 +438,45 @@ There is **no test suite** — verification is `py_compile`, import smoke checks
 
 ## 10. Recent Changes
 
+- **2026-10-21 — Gemini quota skipping, CUDA allocator fix for Turbo, larger AI requests, tidier
+  progress output** (previously left uncommitted from the sessions that produced the 2026-10-18
+  entries below): `_EXHAUSTED_MODELS` + `_is_daily_quota_error()` skip a daily-quota-exhausted model
+  for the rest of the run instead of re-discovering it on every chapter;
+  `_ai_generate_config()` disables AFC so the SDK warning stops printing; `CHATTERBOX_CUDA_ALLOC_CONF
+  = 'expandable_segments:True'` is exported as `PYTORCH_CUDA_ALLOC_CONF` to the Chatterbox bridge
+  subprocess (both `--serve` and the GUI one-shot preview) because Turbo's ~6.9 GB footprint OOMs an
+  8 GB card once the default allocator fragments; `_AI_REWRITE_MAX_TOKENS` is 15_000 (≈60K chars per
+  request); the per-chunk Chatterbox progress line now overwrites itself on one line. `compileall`
+  + `core`/`ui` imports clean.
+
+- **2026-10-21 — `create_m4b` never ran ffmpeg, so finished books produced no M4B and lost their
+  WAVs.** The helper split left `create_m4b` ending at `encode_share = 1.0 - tts_share`; the entire
+  ffmpeg `try/except/finally` block was indented inside `_process_ffmpeg_line` (referencing
+  `ffmpeg_command`, `final_filename`, `stats`, … as nonexistent globals). So `create_m4b` printed
+  the command, created the empty output folder and returned, `pipeline.main` then called
+  `delete_wav_files()` — deleting every chapter WAV with no audiobook produced. `_encode_progress_bar`
+  is now module-level, the progress parser is a closure inside `create_m4b` capturing the real
+  `stats`/`post_event`/`total_audio_secs`/shares, and the ffmpeg run is back in `create_m4b`.
+  `create_m4b` returns `True` only on a successful encode; `pipeline.main` deletes WAVs and posts
+  `CORE_FINISHED` only then, otherwise it keeps the WAVs and posts `CORE_ERROR` (retryable resume).
+  Verified: 2-WAV encode produced a valid `.m4b` and returned `True`; a missing-input encode returned
+  `False`, left no temp files, and the failure path now preserves the source WAVs.
+
+- **2026-10-18 — Exhausted Gemini models are no longer retried on every chapter request.**
+  `_try_gemini_models()` kept trying `gemini-3.8-flash` (the first model in `GEMINI_MODELS`) on
+  every single chapter rewrite: it hit the 180 s watchdog, printed "out of daily quota", fell
+  through to `gemini-3.7-flash`, and on the *next* chapter started over at model 1 — burning
+  180 s per chapter to rediscover what was already known. The free-tier quota is enforced per
+  model per day, so an exhausted model is a dead end for the whole run. New module-level
+  `_EXHAUSTED_MODELS` set (guarded by `_EXHAUSTED_MODELS_LOCK`) records each exhausted model;
+  `_is_exhausted()`/`_mark_exhausted()` skip it on every subsequent request. A model is marked
+  only on a genuine daily-quota error (`_is_daily_quota_error`); a 503 still gets its one
+  1-minute retry and is *not* marked, so a transient demand spike can recover. Verified offline:
+  first call exhausts model 1 and succeeds on model 2; second call skips model 1 outright with
+  no wait; all-11-exhausted gives up in one pass with no backoff rounds; a pre-exhausted model
+  plus 503s on the rest still runs the full retry schedule on the remaining 10. `py_compile` +
+  import clean.
+
 - **2026-10-14 — EPUB extraction no longer duplicates nested content ("sentences repeated").**
   `core/epub.py::find_document_chapters_and_extract_texts` appended `c.text` for every
   `soup.find_all(['title','p','h1-h4','li'])` match, but `find_all` returns nested matches and a
@@ -570,11 +613,22 @@ There is **no test suite** — verification is `py_compile`, import smoke checks
   (no `\n\n`, 173K chars) used to cut mid-sentence and now splits only after `.`; content is
   preserved and every chunk respects the request char cap.
 
-- **2026-10-04 — Memory-bank refresh.** Reconciled §2/§4 module line counts and the `core/__init__`
-  export count with the working tree (core grew to 2630 lines: `gemini.py` 473, `tts/chatterbox.py`
-  289, `pipeline.py` 382, `__init__.py` 213 exporting 72 names; `ui/preview.py` 197,
-  `ui/synthesis.py` 77), and restated §9 to show the UI port staged and the Turbo/tag/bridge edits
-  still unstaged. No code change.
+- **2026-10-18 — Gemini quota exhaustion is per-model; skip the model, don't abort the fallback.**
+  The earlier change that put `RESOURCE_EXHAUSTED`/`quota exceeded`/`QuotaFailure`/`retryDelay` in
+  `_NON_RETRYABLE_ERROR_MARKERS` made the first 429 `RESOURCE_EXHAUSTED` abort the whole model list —
+  but the logged `QuotaFailure` is `GenerateRequestsPerDayPerProjectPerModel-FreeTier` with a `model`
+  dimension, so each of the 11 models has its own 20-request free-tier daily quota. Quota markers are
+  no longer non-retryable. New `_is_daily_quota_error()` (quota markers + `PerDay`/`per day`/`per_day`
+  or a `retryDelay` > 600s) makes `_try_gemini_models()` skip an exhausted model immediately (no
+  1-minute retry), keep trying the others, and give up at once only if every model was quota-exhausted
+  (no pointless 1/2/3/4-minute backoff rounds). `_call_gemini_with_retry()` also stops at once on a
+  daily quota. Per-minute rate limits (`GenerateRequestsPerMinute…`, short `retryDelay`) still get the
+  normal retry path. Also `_ai_generate_config()` now sets
+  `automatic_function_calling=AutomaticFunctionCallingConfig(disable=True)`, which removes the
+  misleading multi-line AFC warning the SDK printed before the first request (no tools are ever used,
+  so there is no Chat session to drive). Verified offline: 429 daily quota on the first model →
+  model 2 is tried immediately; all 11 exhausted → 11 calls, no waits, give up in one pass.
+  `py_compile` + import clean.
 - **2026-10-04 — Chatterbox expressive tags in AI rewrite.** When AI is enabled with the
   Chatterbox engine, `_phonetic_rules_for('chatterbox', 'turbo')` appends `_CHATTERBOX_TAG_RULES`
   to `_CHATTERBOX_PHONETIC_RULES`, so one Gemini pass asks for pronunciation rewrites **and**

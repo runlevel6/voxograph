@@ -93,8 +93,9 @@ class PreviewMixin:
                     ))
                     proc = subprocess.run(
                         [str(core.CHATTERBOX_BRIDGE_PYTHON), str(core.CHATTERBOX_BRIDGE_SCRIPT)],
-                        input=payload, capture_output=True, text=True
-                    )
+                        input=payload, capture_output=True, text=True,
+                        env={**os.environ,
+                             'PYTORCH_CUDA_ALLOC_CONF': core.CHATTERBOX_CUDA_ALLOC_CONF})
                     if proc.returncode != 0:
                         raise RuntimeError(f"Chatterbox bridge failed: {proc.stderr}")
                     result = _extract_bridge_json(proc.stdout)
