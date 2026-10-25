@@ -12,7 +12,9 @@ It currently supports these languages: 🇺🇸 🇬🇧 🇪🇸 🇫🇷 🇮�
 
 On a Google Colab's T4 GPU via Cuda, **it takes about 5 minutes to convert "Animal's Farm" by Orwell** (which is about 160,000 characters) to audiobook, at a rate of about 600 characters per second.
 
-On my M2 MacBook Pro, on CPU, it takes about 1 hour, at a rate of about 60 characters per second.
+On M2 MacBook Pro, on CPU, it takes about 1 hour, at a rate of about 60 characters per second.
+
+[Chatterbox](https://github.com/resemble-ai/chatterbox) is Resemble AI's open-source TTS family, released under the MIT licence. Unlike Kokoro it has no fixed voice list: it clones a speaker from a short reference recording, so the "voice" is whatever clip you give it. Two models are supported here — **Multilingual V3** (0.5B params, 23 languages upstream) and **Turbo** (350M, English-only, with native paralinguistic tags such as `[laugh]` and `[sigh]`). Every Chatterbox output also carries Resemble AI's imperceptible Perth watermark. On a T4 GPU it is noticeably slower than Kokoro, and it needs a separate virtualenv because its torch pin conflicts with Kokoro's; on CPU it works but at a small fraction of Kokoro's characters per second.
 
 
 ## Acknowledgments & Credits
@@ -114,17 +116,27 @@ uses.
 
 Chatterbox ships as a family, chosen from the **Model** dropdown (`chatterbox_model`):
 
-- **Multilingual V3** (default, 500M) — the highest-quality model. It is English-locked in this
-  configuration (23 languages are available upstream) and its delivery is shaped by
+| Model | Size | Languages | Controls | Native tags |
+|-------|------|-----------|----------|-------------|
+| **Multilingual V3** (default) | 500M | 23 upstream; English-locked here | Exaggeration, CFG Weight | — |
+| **Turbo** | 350M | English only | Temperature, Top P, Top K, Repetition Penalty | 19 paralinguistic tags |
+
+- **Multilingual V3** is the highest-quality general-purpose model: it has improved speaker similarity
+  and reduced hallucination compared with earlier multilingual checkpoints. Its delivery is shaped by
   **Exaggeration** (expressiveness; higher also speeds pacing) and **CFG Weight** (adherence to the
-  reference clip's style/pacing).
-- **Turbo** (350M) — smaller, faster and lighter, but English-only. It ignores Exaggeration/CFG
-  Weight and is shaped instead by its sampling knobs: **Temperature**, **Top P**, **Top K** and
-  **Repetition Penalty**. Turbo also understands 19 paralinguistic tags (`[laugh]`, `[sigh]`,
-  `[whispering]`, `[dramatic]`, …), which voxograph inserts automatically when AI rewriting is on.
+  reference clip's style/pacing; lower values stop a fast reference from dragging the pacing along).
+  Upstream V3 understands 23 languages, but voxograph always passes `language_id="en"`, so this
+  configuration is effectively English-only.
+- **Turbo** is the lighter, lower-latency model, built on a 350M architecture with a distilled
+  single-step decoder (much less compute and VRAM than V3). It ignores Exaggeration/CFG Weight and is
+  shaped instead by its sampling knobs: **Temperature**, **Top P**, **Top K** and **Repetition
+  Penalty**. Turbo also understands 19 paralinguistic tags (`[laugh]`, `[sigh]`, `[whispering]`,
+  `[dramatic]`, …), which voxograph inserts automatically when AI rewriting is on. It is English-only
+  and takes no `language_id`.
 
 Each model keeps its own settings in `config.json` (`chatterbox_*` vs `chatterbox_turbo_*`), so
-switching models never loses a tuning choice.
+switching models never loses a tuning choice. Both are MIT-licensed, and every generated clip carries
+Resemble AI's inaudible Perth watermark, which survives re-encoding and editing.
 
 Chatterbox is installed in a **separate virtualenv**, because it pins `torch==2.6.0` while voxograph
 needs a different build, and voxograph talks to it over a small bridge script:
@@ -151,12 +163,25 @@ Two patches are needed on top of stock `chatterbox-tts==0.1.7`: Multilingual V3 
 (thread it through `from_local()` too), and Turbo needs the `chatterbox.tts_turbo` module
 (`ChatterboxTurboTTS`), which may require a newer build.
 
+### Chatterbox voices
+
 Then pick the voice to clone:
 
 - **Voice Preset** — clones `~/.voxograph/voice_samples/<voice>.wav`, a Kokoro rendering of the voice
-  selected in the dropdown. Missing presets are built automatically (or with **Build Sample** /
-  **Build All**, or `python -m voxograph.voice_samples_cli --all`).
-- **Custom WAV** — clones a recording you supply.
+  selected in the dropdown. Every Kokoro voice listed under [Supported Voices](#supported-voices) is a
+  valid preset name; the `af_*`/`am_*`/`bf_*`/`bm_*` English voices are the sensible choices while
+  Chatterbox is English-locked. Each preset is a short, edge-silence-trimmed and peak-normalized clip
+  stored outside the package (so a reinstall does not wipe it). Missing presets are built
+  automatically, and **Build Sample** / **Build All** (or
+  `python -m voxograph.voice_samples_cli --all`) render them on demand.
+- **Custom WAV** — clones a recording you supply. A clean, single-speaker clip of roughly 10 seconds
+  or more gives the best speaker similarity; keep it somewhere permanent (not `/tmp`), because the
+  path is stored in `config.json` and reused on later runs.
+
+Chatterbox has no speed setting: it clones the reference's pacing, so tempo is adjusted indirectly
+with **CFG Weight** (V3) or by choosing a differently paced reference clip. There is also no
+per-voice table to maintain — the preset name is simply the Kokoro voice name, and the same dropdown
+serves both engines.
 
 Both engines then share the rest of the pipeline: chapter WAV caching, normalization, single-pass
 ffmpeg M4B encoding and AI phonetic correction. The AI rewrite rules are engine-aware — Kokoro gets
@@ -164,8 +189,22 @@ inline IPA overrides, stress marks and espeak phonemes; Chatterbox gets plain-En
 (since it does not read IPA), plus the expressive tags for Turbo. Chapter WAVs are tagged per engine
 and model, so switching engines, models or style/sampling settings never reuses stale audio.
 
-Chatterbox is English-locked in this configuration (Multilingual V3 and Turbo alike), and it is
-noticeably slower than Kokoro — expect a fraction of Kokoro's characters-per-second.
+### Chatterbox performance and hardware
+
+- **Model load happens once per run.** The persistent bridge (`generate.py --serve`) keeps the model
+  in memory, so the multi-second load and the multi-gigabyte first-use weight download are paid once,
+  not per chapter. The GUI preview uses the same bridge script in one-shot mode.
+- **GPU strongly recommended.** Select `cuda` or `cpu` in **Compute Device** (`chatterbox_device`).
+  Turbo peaks around 6.9 GB of VRAM, so an 8 GB card can run out once the allocator fragments;
+  voxograph exports `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to the bridge to avoid that.
+  V3 is larger and slower than Turbo. On CPU both work but are far slower.
+- **Expect a fraction of Kokoro's throughput.** Kokoro is ~600 chars/s on a T4 and ~60 chars/s on an
+  M2 CPU; Chatterbox is materially slower in both settings, especially for Multilingual V3. Its
+  advantage is voice cloning and more expressive delivery, not speed.
+
+Chatterbox is English-locked in this configuration (Multilingual V3 and Turbo alike). The rest of the
+pipeline is unchanged: chapters are split at sentence/clause boundaries into ~300-character chunks,
+stitched back together, and then normalized and encoded exactly like Kokoro output.
 
 
 ## How to run on Windows
@@ -190,11 +229,21 @@ By default the audio is generated using a normal speed, but you can make it up t
 voxograph book.epub -v af_sky -s 1.5
 ```
 
+The `speed` setting applies to Kokoro only. Chatterbox has no speed parameter — it follows the pacing
+of the reference clip, and V3 can be nudged with **CFG Weight** / **Exaggeration**.
+
 
 ## Supported Voices
 
 Use `-v` option to specify the voice to use. Available voices are listed here.
 The first letter is the language code and the second is the gender of the speaker e.g. `im_nicola` is an italian male voice.
+
+**Chatterbox uses the same names as presets.** A Chatterbox run clones
+`~/.voxograph/voice_samples/<voice>.wav`, rendered by Kokoro from the selected voice, so every name in
+the table below also works as a Chatterbox voice. Because this configuration passes
+`language_id="en"`, the English voices (`af_*`, `am_*`, `bf_*`, `bm_*`) are the meaningful choices;
+the others can still be cloned as a timbre, but Chatterbox will speak English. There is no
+Chatterbox-specific voice list, and a **Custom WAV** reference bypasses the table entirely.
 
 [For hearing samples of Kokoro-82M voices, go here](https://claudio.uk/posts/audiblez-v4.html)
 
@@ -216,6 +265,12 @@ For more detaila about voice quality, check this document: [Kokoro-82M voices](h
 ## How to run on GPU
 
 By default, voxograph runs on CPU. If you pass the option `--cuda` it will try to use the Cuda device via Torch.
+
+For Chatterbox, GPU use is controlled separately by the **Compute Device** dropdown
+(`chatterbox_device`, `cuda` or `cpu`) and the bridge runs on its own torch build inside
+`~/chatterbox_venv`; `--cuda` does not configure it. Turbo needs roughly 6.9 GB of VRAM at peak, and
+the bridge already sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` so an 8 GB card does not
+fragment itself into an out-of-memory error. On CPU, Chatterbox is considerably slower than Kokoro.
 
 Check out this example: [Audiblez running on a Google Colab Notebook with Cuda ](https://colab.research.google.com/drive/164PQLowogprWQpRjKk33e-8IORAvqXKI?usp=sharing]).
 
