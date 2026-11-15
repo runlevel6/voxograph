@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 
 from .constants import (
-    CONFIG_FILE, DEFAULT_VOICE_SAMPLES_DIR,
+    AI_PROVIDERS, CONFIG_FILE, DEFAULT_AI_PROVIDER, DEFAULT_GEMINI_MODEL,
+    DEEPSEEK_DEFAULT_MODEL, DEFAULT_VOICE_SAMPLES_DIR,
     CHATTERBOX_DEFAULT_EXAGGERATION, CHATTERBOX_DEFAULT_CFG_WEIGHT,
     CHATTERBOX_DEFAULT_MODEL, CHATTERBOX_MODELS,
     CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, CHATTERBOX_TURBO_DEFAULT_TOP_P,
@@ -43,8 +44,20 @@ def load_settings():
             if 'output_folder' in settings:
                 settings['output_folder'] = str(Path(settings['output_folder']))
             settings.setdefault('gemini_api_key', '')
-            settings.setdefault('gemini_model', 'gemini-3.1-flash-lite')
+            # The GUI only exposes the single Gemini sentinel now; an older
+            # config may still hold a concrete model name (e.g.
+            # 'gemini-3.1-flash-lite'). Normalize it to the sentinel so the
+            # dropdown selection and the saved value stay consistent — the
+            # real model is still resolved from GEMINI_MODELS at request time.
+            if settings.get('gemini_model') != DEFAULT_GEMINI_MODEL:
+                settings['gemini_model'] = DEFAULT_GEMINI_MODEL
+            settings.setdefault('gemini_model', DEFAULT_GEMINI_MODEL)
             settings.setdefault('gemini_enabled', False)
+            settings.setdefault('ai_provider', DEFAULT_AI_PROVIDER)
+            settings.setdefault('deepseek_api_key', '')
+            settings.setdefault('deepseek_model', DEEPSEEK_DEFAULT_MODEL)
+            if settings.get('ai_provider') not in AI_PROVIDERS:
+                settings['ai_provider'] = DEFAULT_AI_PROVIDER
             settings.setdefault('last_open_dir', str(Path.home()))
             settings.setdefault('tts_engine', 'kokoro')
             settings.setdefault('chatterbox_ref_audio', '')
@@ -63,7 +76,7 @@ def load_settings():
         return {}
 
 
-def save_settings(output_folder, voice, speed=1.0, gemini_api_key='', gemini_model='gemini-3.1-flash-lite', gemini_enabled=False, last_open_dir='', tts_engine='kokoro', chatterbox_ref_audio='', chatterbox_device='cuda', chatterbox_voice_source='preset', voice_samples_dir='', chatterbox_exaggeration=CHATTERBOX_DEFAULT_EXAGGERATION, chatterbox_cfg_weight=CHATTERBOX_DEFAULT_CFG_WEIGHT, chatterbox_model=CHATTERBOX_DEFAULT_MODEL, chatterbox_turbo_temperature=CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, chatterbox_turbo_top_p=CHATTERBOX_TURBO_DEFAULT_TOP_P, chatterbox_turbo_top_k=CHATTERBOX_TURBO_DEFAULT_TOP_K, chatterbox_turbo_repetition_penalty=CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY):
+def save_settings(output_folder, voice, speed=1.0, gemini_api_key='', gemini_model=DEFAULT_GEMINI_MODEL, gemini_enabled=False, last_open_dir='', tts_engine='kokoro', chatterbox_ref_audio='', chatterbox_device='cuda', chatterbox_voice_source='preset', voice_samples_dir='', chatterbox_exaggeration=CHATTERBOX_DEFAULT_EXAGGERATION, chatterbox_cfg_weight=CHATTERBOX_DEFAULT_CFG_WEIGHT, chatterbox_model=CHATTERBOX_DEFAULT_MODEL, chatterbox_turbo_temperature=CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, chatterbox_turbo_top_p=CHATTERBOX_TURBO_DEFAULT_TOP_P, chatterbox_turbo_top_k=CHATTERBOX_TURBO_DEFAULT_TOP_K, chatterbox_turbo_repetition_penalty=CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY, ai_provider=DEFAULT_AI_PROVIDER, deepseek_api_key='', deepseek_model=DEEPSEEK_DEFAULT_MODEL):
     """
     Saves settings to the JSON configuration file.
     Accepts an optional speed parameter so both core and UI write a
@@ -76,6 +89,9 @@ def save_settings(output_folder, voice, speed=1.0, gemini_api_key='', gemini_mod
         'gemini_api_key': gemini_api_key,
         'gemini_model': gemini_model,
         'gemini_enabled': gemini_enabled,
+        'ai_provider': (ai_provider if ai_provider in AI_PROVIDERS else DEFAULT_AI_PROVIDER),
+        'deepseek_api_key': deepseek_api_key,
+        'deepseek_model': deepseek_model or DEEPSEEK_DEFAULT_MODEL,
         'last_open_dir': last_open_dir,
         'tts_engine': tts_engine,
         'chatterbox_ref_audio': chatterbox_ref_audio,

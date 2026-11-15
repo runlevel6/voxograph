@@ -29,7 +29,7 @@ class PreviewMixin:
         model = self.ai_model_dropdown.GetValue()
 
         if ai_enabled and not api_key:
-            wx.MessageBox("AI phonetic check is enabled but the Gemini API key is missing. "
+            wx.MessageBox("AI phonetic check is enabled but the AI API key is missing. "
                           "Disable AI or enter a key in the settings panel.",
                           "Missing API Key", wx.OK | wx.ICON_INFORMATION)
             return
@@ -143,7 +143,7 @@ class PreviewMixin:
 
         api_key = self.ai_api_key_text_ctrl.GetValue().strip()
         if not api_key:
-            wx.MessageBox("Gemini API key is missing. Please enter it in the settings panel.",
+            wx.MessageBox("AI API key is missing. Please enter it in the settings panel.",
                           "Missing API Key", wx.OK | wx.ICON_INFORMATION)
             return
 

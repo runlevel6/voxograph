@@ -250,7 +250,7 @@ _ROMAN_KEYWORD_RE = re.compile(
 # Explicitly request the largest output budget Gemini accepts, overriding the
 # SDK/model default, so long phonetic rewrites are never silently truncated.
 # Applied as GenerateContentConfig(max_output_tokens=...) on every API call.
-_AI_MAX_OUTPUT_TOKENS = 65536
+_AI_MAX_OUTPUT_TOKENS = 20000
 
 # Backoff schedule requested: retry after 1 minute, then 2, then 3, then 4
 # (each pause is the previous pause + 1 minute). That's 4 retries (5 total
@@ -306,6 +306,46 @@ GEMINI_MODELS = (
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
 )
+
+# ---------------------------------------------------------------------------
+# AI providers (Gemini + DeepSeek)
+# ---------------------------------------------------------------------------
+# DeepSeek V4.1 Flash is the model the local Kilo Code instance runs
+# (Kilo's model id deepseek/deepseek-flash). The API's current canonical name
+# is `deepseek-flash`; the legacy `deepseek-v4-flash` aliases still route to
+# the same V4.1-Flash checkpoint.
+AI_PROVIDER_GEMINI = 'gemini'
+AI_PROVIDER_DEEPSEEK = 'deepseek'
+AI_PROVIDERS = (AI_PROVIDER_GEMINI, AI_PROVIDER_DEEPSEEK)
+DEFAULT_AI_PROVIDER = AI_PROVIDER_GEMINI
+
+# The only Gemini choice exposed in the GUI. It is a sentinel, not a real
+# model name: the AI rewrite path resolves it to the ordered GEMINI_MODELS
+# list and tries each flash/flash-lite model in turn (newest first) until one
+# responds — the free-tier daily quota is enforced per model, so the fallback
+# skips an exhausted model and keeps going instead of burning a timeout on
+# every chapter request. The sentinel is what gets saved as `gemini_model`.
+DEFAULT_GEMINI_MODEL = 'gemini-flash'
+DEEPSEEK_MODELS = (
+    'deepseek-flash',
+    'deepseek-v4-pro',
+)
+DEEPSEEK_DEFAULT_MODEL = DEEPSEEK_MODELS[0]
+# GUI dropdown contents: the single Gemini sentinel + the DeepSeek models.
+AI_MODEL_CHOICES = (DEFAULT_GEMINI_MODEL,) + DEEPSEEK_MODELS
+
+# DeepSeek exposes an OpenAI-compatible Chat Completions endpoint. The base URL
+# matches the `deepseek_direct` provider in Kilo's config; override it with
+# VOXOGRAPH_DEEPSEEK_API_BASE for a proxy or a compatible gateway.
+DEEPSEEK_API_BASE = os.environ.get(
+    'VOXOGRAPH_DEEPSEEK_API_BASE', 'https://api.deepseek.com').rstrip('/')
+DEEPSEEK_CHAT_COMPLETIONS_URL = DEEPSEEK_API_BASE + '/chat/completions'
+
+# DeepSeek V4.1 Flash allows up to 384K output tokens. The app's rewrite
+# requests are <=15K input tokens, so this keeps the rewritten text well
+# inside the response budget while avoiding an unbounded default.
+_DEEPSEEK_MAX_OUTPUT_TOKENS = 20_000
+_DEEPSEEK_REQUEST_TIMEOUT_SECS = _GEMINI_REQUEST_TIMEOUT_SECS
 
 # ---------------------------------------------------------------------------
 # Shared phonetic rewrite rules — single source of truth used by BOTH the

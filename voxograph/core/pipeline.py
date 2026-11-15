@@ -15,6 +15,8 @@ from ebooklib import epub
 from .constants import (
     sample_rate, _SPOKEN_CHARS_PER_SEC, _AAC_ENCODE_RT_FACTOR,
     _AI_MIN_AGGREGATE_TOKENS, _AI_REWRITE_MAX_TOKENS,
+    AI_PROVIDER_DEEPSEEK, AI_PROVIDER_GEMINI, DEFAULT_AI_PROVIDER,
+    DEFAULT_GEMINI_MODEL, DEEPSEEK_DEFAULT_MODEL,
     DEFAULT_VOICE, DEFAULT_VOICE_SAMPLES_DIR,
     CHATTERBOX_DEFAULT_EXAGGERATION, CHATTERBOX_DEFAULT_CFG_WEIGHT,
     CHATTERBOX_DEFAULT_MODEL, CHATTERBOX_MAX_RETRIES, CHATTERBOX_MODEL_TURBO,
@@ -28,7 +30,7 @@ from .utils import _clamp_float, _clamp_int, _clamp_unit_float, strfdelta, _inse
 from .settings import load_settings, save_settings, is_chatterbox_model
 from .nlp import get_nlp, lang_code_from_voice, set_espeak_library
 from .gemini import (
-    _iter_correct_phonetics_ai_pieces, _sanitize_api_key,
+    _api_key_problem, _iter_correct_phonetics_ai_pieces,
 )
 from .epub import (
     find_cover, find_document_chapters_and_extract_texts,
@@ -71,16 +73,24 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
     voice = voice if voice else settings.get('voice', DEFAULT_VOICE)
 
     ai_enabled = bool(settings.get('gemini_enabled', False))
-    ai_api_key = settings.get('gemini_api_key', '') or ''
-    ai_model = settings.get('gemini_model', 'gemini-3.1-flash-lite') or 'gemini-3.1-flash-lite'
+    ai_provider = settings.get('ai_provider', DEFAULT_AI_PROVIDER)
+    if ai_provider == AI_PROVIDER_DEEPSEEK:
+        ai_api_key = settings.get('deepseek_api_key', '') or ''
+        ai_model = settings.get('deepseek_model', DEEPSEEK_DEFAULT_MODEL) or DEEPSEEK_DEFAULT_MODEL
+    else:
+        ai_provider = AI_PROVIDER_GEMINI
+        ai_api_key = settings.get('gemini_api_key', '') or ''
+        ai_model = settings.get('gemini_model', DEFAULT_GEMINI_MODEL) or DEFAULT_GEMINI_MODEL
     if ai_enabled:
-        if not _sanitize_api_key(ai_api_key).startswith('AIza'):
-            print('\033[93m' + 'AI Phonetic Check is enabled but the API key is missing or invalid. '
+        key_problem = _api_key_problem(ai_api_key, ai_model)
+        if key_problem:
+            print('\033[93m' + f'AI Phonetic Check is enabled but the API key is unavailable ({key_problem}) '
                   'Falling back to original text for the whole book.' + '\033[0m')
             ai_enabled = False
         else:
-            print(f'AI Phonetic Check enabled (model={ai_model}). Chapters will be '
-                  f'rewritten in chunks of ~{_AI_REWRITE_MAX_TOKENS:,} tokens before TTS.')
+            print(f'AI Phonetic Check enabled (provider={ai_provider}, model={ai_model}). '
+                  f'Chapters will be rewritten in chunks of ~{_AI_REWRITE_MAX_TOKENS:,} tokens '
+                  'before TTS.')
 
     output_folder.mkdir(parents=True, exist_ok=True)
     print(f"Output folder set to: {output_folder}")
@@ -315,7 +325,7 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
         CORE_ERROR) so the caller can stop the run.
 
         `on_halfway` is invoked (once) when the piece is ~50% spoken, so the
-        caller can start the next Gemini rewrite in the background while the
+        caller can start the next AI rewrite in the background while the
         rest of this piece's TTS finishes — synthesis and the next AI request
         then overlap instead of being strictly serialized.
         """
@@ -378,7 +388,7 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
             audio_segments = []
             write_sample_rate = sample_rate
             if next_ai is not None and next_ai[0] == chapter.chapter_index:
-                # AI chapter: synthesize fragment by fragment. The next Gemini
+                # AI chapter: synthesize fragment by fragment. The next AI
                 # request is started in a background thread once the current
                 # fragment is ~50% spoken (see _on_halfway below), so the rest
                 # of this fragment's TTS and the next AI rewrite run in
@@ -398,14 +408,14 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                         except StopIteration:
                             fetch_state['piece'] = None
                         except Exception as e:
-                            print(f'\033[91mBackground Gemini fetch failed: {e}\033[0m')
+                            print(f'\033[91mBackground AI fetch failed: {e}\033[0m')
                             fetch_state['piece'] = None
                     t = threading.Thread(target=_worker, daemon=True)
                     fetch_state['thread'] = t
                     t.start()
 
                 def _on_halfway():
-                    # Kick off the next Gemini request now, while the rest of
+                    # Kick off the next AI request now, while the rest of
                     # this piece keeps being spoken. Guard against a fetch
                     # already in flight (short pieces may cross 50% more than
                     # once if the callback is invoked per-sentence).
@@ -511,8 +521,11 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
     save_settings(
         output_folder, voice, speed,
         gemini_api_key=settings.get('gemini_api_key', ''),
-        gemini_model=settings.get('gemini_model', 'gemini-3.1-flash-lite'),
+        gemini_model=settings.get('gemini_model', DEFAULT_GEMINI_MODEL),
         gemini_enabled=settings.get('gemini_enabled', False),
+        ai_provider=settings.get('ai_provider', DEFAULT_AI_PROVIDER),
+        deepseek_api_key=settings.get('deepseek_api_key', ''),
+        deepseek_model=settings.get('deepseek_model', DEEPSEEK_DEFAULT_MODEL),
         last_open_dir=settings.get('last_open_dir', ''),
         tts_engine=tts_engine,
         chatterbox_ref_audio=settings.get('chatterbox_ref_audio', ''),

@@ -1,21 +1,27 @@
-"""voxograph.core.gemini - Gemini retry helper, phonetic rules, and AI pronunciation rewrites."""
+"""voxograph.core.gemini - AI provider retry helper, phonetic rules, and pronunciation rewrites."""
 
 
+import json
 import math
 import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from google import genai
 from google.genai import types
 
 from .constants import (
+    AI_PROVIDER_DEEPSEEK, AI_PROVIDER_GEMINI,
+    DEEPSEEK_CHAT_COMPLETIONS_URL, DEEPSEEK_MODELS,
     GEMINI_MODELS,
     _AI_CLAUSE_BREAK_RE, _AI_MAX_OUTPUT_TOKENS, _AI_MIN_AGGREGATE_CHARS,
     _AI_MIN_AGGREGATE_TOKENS, _AI_MIN_PREFIX_CHARS, _AI_PARAGRAPH_BREAK_RE,
     _AI_PART_JOIN, _AI_PART_MARKER, _AI_REWRITE_CHARS_PER_TOKEN,
     _AI_REWRITE_MAX_CHARS, _AI_REWRITE_MAX_TOKENS, _AI_SENTENCE_BREAK_RE,
     _CHATTERBOX_PHONETIC_RULES, _CHATTERBOX_TAG_RULES,
-    _DAILY_QUOTA_ERROR_MARKERS, _GEMINI_REQUEST_TIMEOUT_MS,
+    _DAILY_QUOTA_ERROR_MARKERS, _DEEPSEEK_MAX_OUTPUT_TOKENS,
+    _DEEPSEEK_REQUEST_TIMEOUT_SECS, _GEMINI_REQUEST_TIMEOUT_MS,
     _GEMINI_REQUEST_TIMEOUT_SECS, _GEMINI_RETRY_DELAYS_SECS,
     _NON_RETRYABLE_ERROR_MARKERS, _PHONETIC_RULES, _QUOTA_DAILY_RETRY_DELAY_SECS,
     _QUOTA_ERROR_MARKERS,
@@ -76,6 +82,149 @@ def _gemini_client(api_key):
     )
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek provider (OpenAI-compatible Chat Completions)
+# ---------------------------------------------------------------------------
+
+
+class _AIResponse:
+    """Minimal response wrapper shared by both providers; callers only need
+    the generated text, matching the google-genai response's `.text`."""
+
+    __slots__ = ('text',)
+
+    def __init__(self, text):
+        self.text = text
+
+
+class DeepSeekAPIError(RuntimeError):
+    """A non-success response from the DeepSeek API."""
+
+    def __init__(self, status_code, message):
+        self.status_code = status_code
+        super().__init__(f'DeepSeek API error {status_code}: {message}')
+
+
+# 400/401/402/403/404/422 cannot be fixed by retrying or by another model.
+_DEEPSEEK_NON_RETRYABLE_STATUS = frozenset({400, 401, 402, 403, 404, 422})
+
+
+def _is_deepseek_model(model):
+    """True when `model` names a DeepSeek model rather than a Gemini one."""
+    return str(model or '').strip().lower().startswith('deepseek')
+
+
+def ai_provider_for_model(model):
+    """Return the provider that serves `model`."""
+    return AI_PROVIDER_DEEPSEEK if _is_deepseek_model(model) else AI_PROVIDER_GEMINI
+
+
+def _ai_models_for(model):
+    """Fallback list for the provider that serves `model`.
+
+    DeepSeek models are few, so the requested model is tried first and the
+    remaining DeepSeek models follow. Gemini keeps its long curated list.
+    """
+    if _is_deepseek_model(model):
+        ordered = (model,) + tuple(m for m in DEEPSEEK_MODELS if m != model)
+        return ordered
+    return GEMINI_MODELS
+
+
+def _deepseek_error_detail(body):
+    """Extract a human-readable message from a DeepSeek error body."""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return (body or '').strip()[:500] or 'empty response body'
+    error = payload.get('error', payload) if isinstance(payload, dict) else payload
+    if isinstance(error, dict):
+        detail = error.get('message') or error.get('detail') or json.dumps(error)
+    else:
+        detail = str(error)
+    return detail[:500]
+
+
+def _deepseek_generate(api_key, model, contents):
+    """One non-streaming DeepSeek Chat Completions call.
+
+    Thinking mode is disabled: the phonetic rewriter wants the final rewrite,
+    not a chain-of-thought, and non-thinking mode gives the requested
+    max_tokens budget entirely to the output.
+    """
+    payload = {
+        'model': model,
+        'messages': [{'role': 'user', 'content': contents}],
+        'max_tokens': _DEEPSEEK_MAX_OUTPUT_TOKENS,
+        'thinking': {'type': 'disabled'},
+        'stream': False,
+    }
+    request = urllib.request.Request(
+        DEEPSEEK_CHAT_COMPLETIONS_URL,
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {api_key}',
+        },
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(
+                request, timeout=_DEEPSEEK_REQUEST_TIMEOUT_SECS) as response:
+            body = response.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as exc:
+        detail = _deepseek_error_detail(exc.read().decode('utf-8', 'replace'))
+        raise DeepSeekAPIError(exc.code, detail) from exc
+    except urllib.error.URLError as exc:
+        raise ConnectionError(f'DeepSeek request failed: {exc.reason}') from exc
+
+    try:
+        data = json.loads(body)
+    except ValueError as exc:
+        raise RuntimeError(f'DeepSeek returned invalid JSON: {body[:300]}') from exc
+
+    choices = data.get('choices') or []
+    if not choices:
+        detail = _deepseek_error_detail(body)
+        raise RuntimeError(f'DeepSeek returned no choices: {detail}')
+    message = choices[0].get('message') or {}
+    finish_reason = choices[0].get('finish_reason')
+    if finish_reason == 'length':
+        raise RuntimeError(
+            'DeepSeek response hit the max_tokens limit and was truncated.')
+    text = (message.get('content') or '').strip()
+    if not text:
+        raise RuntimeError(
+            f'DeepSeek returned no text content (finish_reason={finish_reason}).')
+    return _AIResponse(text)
+
+
+def _ai_generate_content(api_key, model, contents):
+    """Dispatch one text-generation request to the provider for `model`."""
+    if _is_deepseek_model(model):
+        return _deepseek_generate(api_key, model, contents)
+    client = _gemini_client(api_key)
+    return client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=_ai_generate_config(),
+    )
+
+
+def _api_key_problem(api_key, model):
+    """Return a user-facing key problem, or None when the key looks usable."""
+    api_key = _sanitize_api_key(api_key)
+    if not api_key:
+        return 'API key is missing.'
+    if _is_deepseek_model(model):
+        if not api_key.startswith('sk-'):
+            return "DeepSeek API keys typically start with 'sk-'."
+    elif not api_key.startswith('AIza'):
+        return "Gemini API keys typically start with 'AIza'."
+    return None
+
+
 def _render_progress_bar(elapsed, total, width=20):
     """Render a text progress bar showing elapsed/total progress."""
     fraction = max(0.0, min(1.0, elapsed / total))
@@ -116,7 +265,7 @@ def _call_gemini_with_timeout(func, *args, timeout=_GEMINI_REQUEST_TIMEOUT_SECS,
         if stop_event and stop_event.is_set():
             break
         bar = _render_progress_bar(elapsed, timeout)
-        print(f'\033[96m[Gemini] {label}: waiting for response {bar} '
+        print(f'\033[96m[AI] {label}: waiting for response {bar} '
               f'{math.ceil(remaining)}s left\033[0m', end='\r', flush=True)
         printed = True
         worker.join(min(1.0, remaining))
@@ -161,10 +310,14 @@ def _is_daily_quota_error(exc) -> bool:
     return False
 
 
-def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
+def _try_gemini_models(func, *args, stop_event=None, post_event=None, models=None, **kwargs):
     """
-    Try calling func(model, *args, **kwargs) with each model in GEMINI_MODELS
-    until one succeeds. func must accept `model` as its first argument.
+    Try calling func(model, *args, **kwargs) with each model in `models`
+    (GEMINI_MODELS by default) until one succeeds. func must accept `model` as
+    its first argument.
+
+    When a DeepSeek model is selected, the caller passes the DeepSeek model
+    list so the same fallback/retry machinery drives either provider.
 
     Each model is tried once; a busy/unavailable model (retryable error, e.g.
     503) waits 1 minute and retries the SAME model once before moving on — a
@@ -187,35 +340,36 @@ def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
     model-specific, so they abort immediately without trying other models.
     """
     last_exc = None
+    model_list = tuple(models or GEMINI_MODELS)
     total_rounds = len(_GEMINI_RETRY_DELAYS_SECS) + 1
     give_up_for_quota = False
     for round_index in range(total_rounds):
         if round_index > 0:
-            print(f'\033[96m[Gemini] Retry round {round_index}/{total_rounds - 1} '
-                  f'(all {len(GEMINI_MODELS)} models)\033[0m')
+            print(f'\033[96m[AI] Retry round {round_index}/{total_rounds - 1} '
+                  f'(all {len(model_list)} models)\033[0m')
         failed_models = 0
         quota_models = 0
-        available = [m for m in GEMINI_MODELS if not _is_exhausted(m)]
+        available = [m for m in model_list if not _is_exhausted(m)]
         if not available:
             give_up_for_quota = True
-            print('\033[91m[Gemini] Every model is out of daily quota. '
+            print('\033[91m[AI] Every model is out of daily quota. '
                   'Not waiting for a reset that is hours away.\033[0m')
             break
-        for i, model in enumerate(GEMINI_MODELS):
+        for i, model in enumerate(model_list):
             if stop_event and stop_event.is_set():
                 if last_exc:
                     raise last_exc
                 raise RuntimeError('Stopped by user.')
             if _is_exhausted(model):
                 continue
-            print(f'\033[96m[Gemini] Trying model {i+1}/{len(GEMINI_MODELS)}: {model}\033[0m')
+            print(f'\033[96m[AI] Trying model {i+1}/{len(model_list)}: {model}\033[0m')
             try:
                 return _call_gemini_with_timeout(func, model, *args,
                                                  stop_event=stop_event, label=model, **kwargs)
             except GeminiTimeoutError as e:
                 last_exc = e
                 failed_models += 1
-                print(f'\033[93m[Gemini] Model {model} gave no response within '
+                print(f'\033[93m[AI] Model {model} gave no response within '
                       f'{_GEMINI_REQUEST_TIMEOUT_SECS}s. Trying next model...\033[0m')
                 continue
             except Exception as e:
@@ -225,8 +379,8 @@ def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
                     raise
                 # Permanent error: not model-specific, so no point trying others.
                 if not _is_retryable_gemini_error(e):
-                    print(f'\033[91m[Gemini] Model {model} failed with non-retryable error: {e}\033[0m')
-                    print('\033[91m[Gemini] Stopping model fallback (error is not model-specific)\033[0m')
+                    print(f'\033[91m[AI] Model {model} failed with non-retryable error: {e}\033[0m')
+                    print('\033[91m[AI] Stopping model fallback (error is not model-specific)\033[0m')
                     raise
                 # Daily quota is enforced per model: skip this one for the rest
                 # of the run (a 1-minute retry cannot help) and keep the
@@ -234,21 +388,21 @@ def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
                 if _is_daily_quota_error(e):
                     _mark_exhausted(model)
                     quota_models += 1
-                    print(f'\033[93m[Gemini] Model {model} is out of daily quota. '
+                    print(f'\033[93m[AI] Model {model} is out of daily quota. '
                           f'Trying next model...\033[0m')
                     continue
                 # Busy/unavailable (e.g. 503): wait 1 minute and retry the
                 # SAME model once — a demand spike is usually temporary and
                 # the first model is often still the best bet. If the retry
                 # also fails, move on to the next model.
-                print(f'\033[93m[Gemini] Model {model} failed: {e}. Waiting 1 '
+                print(f'\033[93m[AI] Model {model} failed: {e}. Waiting 1 '
                       f'minute before retrying {model}...\033[0m')
                 _sleep_with_stop_event(60, stop_event)
                 if stop_event and stop_event.is_set():
                     if last_exc:
                         raise last_exc
                     raise RuntimeError('Stopped by user.')
-                print(f'\033[96m[Gemini] Retrying model {i+1}/{len(GEMINI_MODELS)}: '
+                print(f'\033[96m[AI] Retrying model {i+1}/{len(model_list)}: '
                       f'{model}\033[0m')
                 try:
                     return _call_gemini_with_timeout(func, model, *args,
@@ -256,34 +410,34 @@ def _try_gemini_models(func, *args, stop_event=None, post_event=None, **kwargs):
                 except Exception as retry_exc:
                     last_exc = retry_exc
                     if not _is_retryable_gemini_error(retry_exc):
-                        print(f'\033[91m[Gemini] Model {model} retry failed with '
+                        print(f'\033[91m[AI] Model {model} retry failed with '
                               f'non-retryable error: {retry_exc}\033[0m')
-                        print('\033[91m[Gemini] Stopping model fallback '
+                        print('\033[91m[AI] Stopping model fallback '
                               '(error is not model-specific)\033[0m')
                         raise
                     if _is_daily_quota_error(retry_exc):
                         _mark_exhausted(model)
                         quota_models += 1
-                        print(f'\033[93m[Gemini] Model {model} is out of daily quota. '
+                        print(f'\033[93m[AI] Model {model} is out of daily quota. '
                               f'Trying next model...\033[0m')
                         continue
-                    print(f'\033[93m[Gemini] Model {model} retry also failed: '
+                    print(f'\033[93m[AI] Model {model} retry also failed: '
                           f'{retry_exc}. Trying next model...\033[0m')
         if failed_models and quota_models == failed_models:
             give_up_for_quota = True
-            print('\033[91m[Gemini] Every model is out of daily quota. '
+            print('\033[91m[AI] Every model is out of daily quota. '
                   'Not waiting for a reset that is hours away.\033[0m')
             break
         if round_index < len(_GEMINI_RETRY_DELAYS_SECS):
             delay = _GEMINI_RETRY_DELAYS_SECS[round_index]
-            print(f'\033[93m[Gemini] All {len(GEMINI_MODELS)} models failed. Waiting '
+            print(f'\033[93m[AI] All {len(model_list)} models failed. Waiting '
                   f'{delay // 60} minute(s) before retrying the full list '
                   f'(round {round_index + 2}/{total_rounds})...\033[0m')
             _sleep_with_stop_event(delay, stop_event)
     if post_event and last_exc and _is_retryable_gemini_error(last_exc):
         post_event('CORE_AI_RETRY_EXHAUSTED', message=f'All models failed. Last error: {last_exc}')
     if not give_up_for_quota:
-        print(f'\033[91m[Gemini] All {len(GEMINI_MODELS)} models failed across '
+        print(f'\033[91m[AI] All {len(model_list)} models failed across '
               f'{total_rounds} round(s). Giving up.\033[0m')
     raise last_exc
 
@@ -307,6 +461,8 @@ def _mark_exhausted(model):
 
 
 def _is_retryable_gemini_error(exc) -> bool:
+    if isinstance(exc, DeepSeekAPIError):
+        return exc.status_code not in _DEEPSEEK_NON_RETRYABLE_STATUS
     msg = str(exc)
     return not any(marker in msg for marker in _NON_RETRYABLE_ERROR_MARKERS)
 
@@ -345,23 +501,23 @@ def _call_gemini_with_retry(func, *args, stop_event=None, post_event=None, **kwa
                 raise last_exc
             raise RuntimeError('Stopped by user.')
         if attempt > 0:
-            print(f'\033[96m[Gemini] Retry attempt {attempt}/{total_attempts - 1}\033[0m')
+            print(f'\033[96m[AI] Retry attempt {attempt}/{total_attempts - 1}\033[0m')
         try:
             return _call_gemini_with_timeout(func, *args, stop_event=stop_event, **kwargs)
         except Exception as e:
             last_exc = e
             if _is_daily_quota_error(e):
-                print('\033[91m[Gemini] Daily quota exhausted; not retrying.\033[0m')
+                print('\033[91m[AI] Daily quota exhausted; not retrying.\033[0m')
                 break
             more_attempts_left = attempt < len(_GEMINI_RETRY_DELAYS_SECS)
             if more_attempts_left and _is_retryable_gemini_error(e):
                 delay = _GEMINI_RETRY_DELAYS_SECS[attempt]
-                print(f'\033[93m[Gemini] Call failed ({e}). Retrying in {delay // 60} '
+                print(f'\033[93m[AI] Call failed ({e}). Retrying in {delay // 60} '
                       f'minute(s)... (attempt {attempt + 2}/{total_attempts})\033[0m')
                 _sleep_with_stop_event(delay, stop_event)
             else:
                 if not more_attempts_left:
-                    print(f'\033[91m[Gemini] All retry attempts exhausted ({total_attempts} total)\033[0m')
+                    print(f'\033[91m[AI] All retry attempts exhausted ({total_attempts} total)\033[0m')
                 break
     if post_event and last_exc and _is_retryable_gemini_error(last_exc):
         post_event('CORE_AI_RETRY_EXHAUSTED', message=str(last_exc))
@@ -391,12 +547,12 @@ def _phonetic_rules_for(tts_engine, chatterbox_model=None):
     return rules
 
 
-def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite',
+def check_phonetic_transcription_ai(text, api_key, model='gemini-flash',
                                     stop_event=None, tts_engine='kokoro',
                                     chatterbox_model=None, use_model_fallback=True):
     """
-    Use Google Gemini AI to analyze text for potential TTS pronunciation issues
-    and provide phonetic transcription guidance.
+    Use an AI model (Gemini or DeepSeek, selected by `model`) to analyze text
+    for potential TTS pronunciation issues and provide phonetic guidance.
 
     Returns a string with the AI's explanation/suggestions, followed by the
     actual rewritten text — produced by the same correct_phonetics_ai() /
@@ -408,26 +564,25 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
     _ai_rewrite_single_chunk so the explanation and the actual rewrite can
     never disagree about what counts as an issue worth fixing.
 
-    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
-    until one succeeds. If False, uses the specified `model` only.
+    If `use_model_fallback` is True (default), tries the provider's model list
+    in order until one succeeds. If False, uses the specified `model` only.
     """
     if not text.strip():
         return "Error: text is empty."
 
     api_key = _sanitize_api_key(api_key)
-    if not api_key:
-        return "Error: API key is missing. Please paste it in the AI Phonetic Check section."
-    if not api_key.startswith('AIza'):
-        return "Error: API key looks invalid (Gemini keys typically start with 'AIza'). Please check the value you pasted."
+    problem = _api_key_problem(api_key, model)
+    if problem:
+        return f"Error: {problem} Please paste it in the AI Phonetic Check section."
 
     rules = _phonetic_rules_for(tts_engine, chatterbox_model)
     engine_name = 'Chatterbox' if tts_engine == 'chatterbox' else 'Kokoro'
 
     def _do_call(m):
-        client = _gemini_client(api_key)
-        return client.models.generate_content(
-            model=m,
-            contents=(
+        return _ai_generate_content(
+            api_key,
+            m,
+            (
                 f"You are a phonetic transcription expert for a {engine_name} text-to-speech system. "
                 "Analyze the following text from an audiobook and identify words or phrases "
                 "that might be mispronounced by the TTS engine, using EXACTLY the same rules "
@@ -444,21 +599,25 @@ def check_phonetic_transcription_ai(text, api_key, model='gemini-3.1-flash-lite'
                 "If the text looks clean with no obvious issues, say so and provide a brief confirmation.\n\n"
                 f"Text to analyze:\n\"\"\"\n{text}\n\"\"\""
             ),
-            config=_ai_generate_config(),
         )
 
     try:
         if use_model_fallback:
-            response = _try_gemini_models(_do_call, stop_event=stop_event)
+            response = _try_gemini_models(
+                _do_call, stop_event=stop_event, models=_ai_models_for(model))
         else:
             response = _call_gemini_with_retry(lambda: _do_call(model), stop_event=stop_event)
         analysis = response.text.strip()
     except Exception as e:
         msg = str(e)
         if '404' in msg and 'NOT_FOUND' in msg:
+            if _is_deepseek_model(model):
+                suggestions = 'deepseek-flash or deepseek-v4-pro'
+            else:
+                suggestions = 'gemini-flash (the GUI tries every flash/flash-lite model)'
             return (f"Error: the model '{model}' is not available for your API key/account. "
-                    f"Please pick a current model in the GUI (e.g. gemini-3.1-flash-lite, "
-                    f"gemini-3.5-flash, or gemini-flash-lite-latest) and try again.\n\nDetails: {msg}")
+                    f"Please pick a current model in the GUI (e.g. {suggestions}) and try again."
+                    f"\n\nDetails: {msg}")
         return f"Error during AI analysis: {msg}"
 
     # Produce the actual TTS-bound text using the exact same rewrite path
@@ -642,23 +801,24 @@ def _ai_pack_units(chapters, max_chars, min_chars):
     return units
 
 
-def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
+def correct_phonetics_ai(text, api_key, model='gemini-flash',
                          stop_event=None, post_event=None,
                          chapter_index=None, chapter_total=None, tts_engine='kokoro',
                          chatterbox_model=None, use_model_fallback=True):
     """
-    Use Google Gemini AI to silently rewrite text for TTS-friendly pronunciation.
+    Use an AI model (Gemini or DeepSeek, selected by `model`) to silently
+    rewrite text for TTS-friendly pronunciation.
 
-    For long inputs the text is split into chunks of at most ~8K tokens
-    (≈ 32K chars) and each chunk is rewritten in its own request. The
-    chunks are joined with blank lines to mirror the paragraph structure
-    of the input.
+    For long inputs the text is split into chunks of at most
+    ~_AI_REWRITE_MAX_TOKENS tokens (≈ 60K chars) and each chunk is rewritten
+    in its own request. The chunks are joined with blank lines to mirror the
+    paragraph structure of the input.
 
     `tts_engine` selects which phonetic ruleset to apply: Kokoro accepts inline
     IPA overrides, while Chatterbox must be fed plain-English respellings only.
 
-    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
-    until one succeeds. If False, uses the specified `model` only.
+    If `use_model_fallback` is True (default), tries the provider's model list
+    in order until one succeeds. If False, uses the specified `model` only.
 
     Returns the corrected text string suitable for direct use as TTS input.
     If AI cannot be reached or returns invalid output, the original text is
@@ -668,7 +828,7 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
         return text
 
     api_key = _sanitize_api_key(api_key)
-    if not api_key or not api_key.startswith('AIza'):
+    if _api_key_problem(api_key, model):
         return text
 
     chunks = _ai_split_paragraphs(text, _AI_REWRITE_MAX_CHARS)
@@ -697,7 +857,7 @@ def correct_phonetics_ai(text, api_key, model='gemini-3.1-flash-lite',
 
 def _ai_rewrite_combined_unit(unit, api_key, model, stop_event=None, post_event=None,
                               tts_engine='kokoro', chatterbox_model=None, use_model_fallback=True):
-    """Rewrite several chapters in one Gemini request, joined by
+    """Rewrite several chapters in one AI request, joined by
     _AI_PART_MARKER, and return a list of rewritten pieces matching `unit`.
 
     Falls back to one request per piece if the model does not preserve the
@@ -737,7 +897,7 @@ def _rewrite_packed_unit(unit, api_key, model, stop_event=None, post_event=None,
         tts_engine=tts_engine, chatterbox_model=chatterbox_model, use_model_fallback=use_model_fallback)
 
 
-def _iter_correct_phonetics_ai_pieces(chapters, api_key, model='gemini-3.1-flash-lite',
+def _iter_correct_phonetics_ai_pieces(chapters, api_key, model='gemini-flash',
                                       stop_event=None, post_event=None, tts_engine='kokoro',
                                       chatterbox_model=None, chapter_total=None, use_model_fallback=True):
     """Rewrite a run of chapters for TTS and yield every piece as it returns.
@@ -749,7 +909,7 @@ def _iter_correct_phonetics_ai_pieces(chapters, api_key, model='gemini-3.1-flash
     chapter). That lets the synthesis loop start speaking a long chapter after
     its first fragment instead of waiting for the whole chapter to be
     rewritten — a 300K+ char chapter is split into a dozen units, so the gate
-    used to leave the TTS loop silent for a dozen back-to-back Gemini requests.
+    used to leave the TTS loop silent for a dozen back-to-back AI requests.
 
     Yields (chapter_index, rewritten_piece, is_last_piece). A chapter that fits
     in one piece yields exactly one tuple with is_last_piece=True.
@@ -758,7 +918,7 @@ def _iter_correct_phonetics_ai_pieces(chapters, api_key, model='gemini-3.1-flash
         return
 
     api_key = _sanitize_api_key(api_key)
-    if not api_key or not api_key.startswith('AIza'):
+    if _api_key_problem(api_key, model):
         return
 
     units = _ai_pack_units(chapters, _AI_REWRITE_MAX_CHARS, _AI_MIN_AGGREGATE_CHARS)
@@ -787,14 +947,14 @@ def _iter_correct_phonetics_ai_pieces(chapters, api_key, model='gemini-3.1-flash
             yield chapter_index, out, seen >= pieces_total[chapter_index]
 
 
-def iter_correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flash-lite',
+def iter_correct_phonetics_ai_chapters(chapters, api_key, model='gemini-flash',
                                        stop_event=None, post_event=None, tts_engine='kokoro',
                                        chatterbox_model=None, chapter_total=None, use_model_fallback=True):
     """Rewrite a run of chapters for TTS, one packed AI request at a time.
 
     `chapters` is a list of (chapter_index, text). Chapters below
     ~1K tokens are merged with the leading part of the next chapter, and
-    every request is kept at or below ~8K tokens (whole chapters are packed
+    every request is kept at or below ~15K tokens (whole chapters are packed
     first, splitting a chapter at a real boundary only to top up a request
     that would otherwise close too small).
 
@@ -804,8 +964,8 @@ def iter_correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flas
     AI request is issued, spreading the API calls out in time (AI -> TTS ->
     AI -> TTS) instead of firing every request up front.
 
-    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
-    until one succeeds. If False, uses the specified `model` only.
+    If `use_model_fallback` is True (default), tries the provider's model list
+    in order until one succeeds. If False, uses the specified `model` only.
     """
     pieces_by_chapter = {}
     for chapter_index, out, is_last in _iter_correct_phonetics_ai_pieces(
@@ -818,7 +978,7 @@ def iter_correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flas
             yield chapter_index, '\n\n'.join(piece for piece in pieces if piece)
 
 
-def correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flash-lite',
+def correct_phonetics_ai_chapters(chapters, api_key, model='gemini-flash',
                                   stop_event=None, post_event=None, tts_engine='kokoro',
                                   chatterbox_model=None, chapter_total=None, use_model_fallback=True):
     """Rewrite a run of chapters for TTS, packing them into AI requests.
@@ -828,8 +988,8 @@ def correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flash-lit
     Chapters are joined back with blank lines, mirroring correct_phonetics_ai's
     multi-chunk output.
 
-    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
-    until one succeeds. If False, uses the specified `model` only.
+    If `use_model_fallback` is True (default), tries the provider's model list
+    in order until one succeeds. If False, uses the specified `model` only.
     """
     return dict(iter_correct_phonetics_ai_chapters(
         chapters, api_key, model=model, stop_event=stop_event, post_event=post_event,
@@ -837,10 +997,10 @@ def correct_phonetics_ai_chapters(chapters, api_key, model='gemini-3.1-flash-lit
         chapter_total=chapter_total, use_model_fallback=use_model_fallback))
 
 
-def _ai_rewrite_single_chunk(text, api_key, model='gemini-3.1-flash-lite', stop_event=None, post_event=None,
+def _ai_rewrite_single_chunk(text, api_key, model='gemini-flash', stop_event=None, post_event=None,
                              tts_engine='kokoro', chatterbox_model=None,
                              part_separator=None, part_count=0, use_model_fallback=True):
-    """Single-chunk Gemini call used by correct_phonetics_ai. Falls back to
+    """Single-chunk AI call used by correct_phonetics_ai. Falls back to
     the original text on any failure or invalid output (after retries).
 
     Uses a two-section output format (NAMES_FOUND then REWRITTEN_TEXT) to
@@ -852,8 +1012,8 @@ def _ai_rewrite_single_chunk(text, api_key, model='gemini-3.1-flash-lite', stop_
     exact marker; the model is told to preserve every marker so the caller can
     split the rewrite back into chapters.
 
-    If `use_model_fallback` is True (default), tries GEMINI_MODELS in order
-    until one succeeds. If False, uses the specified `model` only.
+    If `use_model_fallback` is True (default), tries the provider's model list
+    in order until one succeeds. If False, uses the specified `model` only.
     """
     engine_name = 'Chatterbox' if tts_engine == 'chatterbox' else 'Kokoro'
     rules = _phonetic_rules_for(tts_engine, chatterbox_model)
@@ -869,10 +1029,10 @@ def _ai_rewrite_single_chunk(text, api_key, model='gemini-3.1-flash-lite', stop_
         )
 
     def _do_call(m):
-        client = _gemini_client(api_key)
-        return client.models.generate_content(
-            model=m,
-            contents=(
+        return _ai_generate_content(
+            api_key,
+            m,
+            (
                 f"You are a phonetic preprocessing step for the {engine_name} TTS engine. "
                 "You will do this in two steps, and your response MUST contain both "
                 "sections below, in order, with the exact headers shown.\n\n"
@@ -896,16 +1056,17 @@ def _ai_rewrite_single_chunk(text, api_key, model='gemini-3.1-flash-lite', stop_
                 "<the full rewritten text, nothing else — no commentary, no quotes, no labels>\n\n"
                 f"Text:\n\"\"\"\n{text}\n\"\"\""
             ),
-            config=_ai_generate_config(),
         )
 
     try:
         if use_model_fallback:
-            response = _try_gemini_models(_do_call, stop_event=stop_event, post_event=post_event)
+            response = _try_gemini_models(
+                _do_call, stop_event=stop_event, post_event=post_event,
+                models=_ai_models_for(model))
         else:
             response = _call_gemini_with_retry(lambda: _do_call(model), stop_event=stop_event, post_event=post_event)
     except Exception as e:
-        print(f'\033[91mGemini rewrite failed, keeping original text for this chunk: {e}\033[0m')
+        print(f'\033[91mAI rewrite failed, keeping original text for this chunk: {e}\033[0m')
         return text
 
     raw = (response.text or '').strip()

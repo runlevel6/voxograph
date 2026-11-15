@@ -5,8 +5,11 @@ import torch.cuda
 import wx
 from voxograph.core import (
     DEFAULT_VOICE,
+    ai_provider_for_model,
 )
 from voxograph.core.constants import (
+    AI_MODEL_CHOICES, AI_PROVIDER_DEEPSEEK, AI_PROVIDER_GEMINI,
+    DEFAULT_AI_PROVIDER, DEFAULT_GEMINI_MODEL, DEEPSEEK_DEFAULT_MODEL,
     CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, CHATTERBOX_TURBO_DEFAULT_TOP_P,
     CHATTERBOX_TURBO_DEFAULT_TOP_K, CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY,
     CHATTERBOX_TURBO_TEMPERATURE_RANGE, CHATTERBOX_TURBO_TOP_P_RANGE,
@@ -295,16 +298,44 @@ class ParamsMixin:
         sizer.Add(ai_enabled_label, pos=(13, 0), flag=wx.ALL, border=border)
         sizer.Add(ai_enabled_checkbox, pos=(13, 1), flag=wx.ALL, border=border)
 
-        api_key_label = wx.StaticText(panel, label="Gemini API Key:")
-        api_key_text_input = wx.TextCtrl(panel, value=self.settings.get('gemini_api_key', ''), style=wx.TE_PASSWORD)
+        initial_provider = self.settings.get('ai_provider', DEFAULT_AI_PROVIDER)
+        if initial_provider not in (AI_PROVIDER_GEMINI, AI_PROVIDER_DEEPSEEK):
+            initial_provider = DEFAULT_AI_PROVIDER
+        if initial_provider == AI_PROVIDER_DEEPSEEK:
+            initial_ai_model = self.settings.get('deepseek_model', DEEPSEEK_DEFAULT_MODEL)
+        else:
+            initial_ai_model = self.settings.get('gemini_model', DEFAULT_GEMINI_MODEL)
+        self._ai_keys = {
+            AI_PROVIDER_GEMINI: self.settings.get('gemini_api_key', ''),
+            AI_PROVIDER_DEEPSEEK: self.settings.get('deepseek_api_key', ''),
+        }
+        self._ai_models = {
+            AI_PROVIDER_GEMINI: self.settings.get('gemini_model', DEFAULT_GEMINI_MODEL),
+            AI_PROVIDER_DEEPSEEK: self.settings.get('deepseek_model', DEEPSEEK_DEFAULT_MODEL),
+        }
+        self._ai_provider_loaded = initial_provider
+
+        api_key_label = wx.StaticText(panel, label=self._ai_key_label(initial_provider))
+        api_key_text_input = wx.TextCtrl(
+            panel, value=self._ai_keys.get(initial_provider, ''), style=wx.TE_PASSWORD)
         api_key_text_input.Bind(wx.EVT_TEXT, self.on_ai_api_key_changed)
+        self.ai_api_key_label = api_key_label
         self.ai_api_key_text_ctrl = api_key_text_input
         sizer.Add(api_key_label, pos=(14, 0), flag=wx.ALL, border=border)
         sizer.Add(api_key_text_input, pos=(14, 1), flag=wx.ALL | wx.EXPAND, border=border)
 
-        ai_model_label = wx.StaticText(panel, label="Gemini Model:")
-        ai_model_choices = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-flash-lite-latest']
-        ai_model_dropdown = wx.ComboBox(panel, choices=ai_model_choices, value=self.settings.get('gemini_model', 'gemini-3.1-flash-lite'))
+        ai_model_label = wx.StaticText(panel, label="AI Model:")
+        ai_model_dropdown = wx.ComboBox(
+            panel, choices=list(AI_MODEL_CHOICES), value=initial_ai_model)
+        ai_model_dropdown.SetToolTip(
+            "Gemini: the single 'gemini-flash' entry is a sentinel — the app "
+            "tries every Gemini flash/flash-lite model in turn (newest first) "
+            "until one responds, skipping models that are out of daily quota, "
+            "so no per-model choice is needed. Needs a Gemini API key "
+            "(starts with 'AIza').\n"
+            "deepseek-flash is DeepSeek V4.1 Flash — the same model the local "
+            "Kilo Code instance runs — and needs a DeepSeek API key (starts "
+            "with 'sk-'). Each provider keeps its own saved key.")
         ai_model_dropdown.Bind(wx.EVT_COMBOBOX, self.on_ai_model_changed)
         self.ai_model_dropdown = ai_model_dropdown
         sizer.Add(ai_model_label, pos=(15, 0), flag=wx.ALL, border=border)
@@ -367,7 +398,23 @@ class ParamsMixin:
         self.save_current_settings()
     def on_ai_enabled_changed(self, event):
         self.save_current_settings()
+    def _ai_key_label(self, provider):
+        return "DeepSeek API Key:" if provider == AI_PROVIDER_DEEPSEEK else "Gemini API Key:"
+    def _sync_ai_provider(self):
+        """Swap the key field when the selected model belongs to another provider."""
+        provider = ai_provider_for_model(self.ai_model_dropdown.GetValue())
+        self._ai_models[provider] = self.ai_model_dropdown.GetValue()
+        if provider == self._ai_provider_loaded:
+            return
+        self._ai_keys[self._ai_provider_loaded] = self.ai_api_key_text_ctrl.GetValue()
+        self._ai_provider_loaded = provider
+        self.ai_api_key_text_ctrl.SetValue(self._ai_keys.get(provider, ''))
+        self.ai_api_key_label.SetLabel(self._ai_key_label(provider))
+        self.params_panel.Layout()
     def on_ai_api_key_changed(self, event):
+        if hasattr(self, '_ai_keys'):
+            self._ai_keys[self._ai_provider_loaded] = self.ai_api_key_text_ctrl.GetValue()
         self.save_current_settings()
     def on_ai_model_changed(self, event):
+        self._sync_ai_provider()
         self.save_current_settings()

@@ -37,7 +37,7 @@ class CoreEventsMixin:
     def on_core_ai_retry_exhausted(self, event):
         msg = getattr(event, 'message', 'AI service unavailable after multiple retries.')
         answer = wx.MessageBox(
-            f"The Gemini AI service is currently unavailable or experiencing high demand.\n\n"
+            f"The AI service is currently unavailable or experiencing high demand.\n\n"
             f"All retry attempts have been exhausted.\n\n"
             f"Details: {msg}\n\n"
             f"Click OK to continue synthesis without AI phonetic correction, "
