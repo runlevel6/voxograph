@@ -18,6 +18,8 @@ from ..constants import (
     CHATTERBOX_DEFAULT_EXAGGERATION, CHATTERBOX_DEFAULT_CFG_WEIGHT,
     CHATTERBOX_DEFAULT_MODEL, CHATTERBOX_LANGUAGE_ID, CHATTERBOX_T3_MODEL,
     CHATTERBOX_CUDA_ALLOC_CONF,
+    CHATTERBOX_MAX_CHUNK_TOKENS, CHATTERBOX_MAX_CHUNK_SILENCE_RATIO,
+    CHATTERBOX_CHUNK_MAX_RETRIES,
     _CHATTERBOX_NOISE_MARKERS, sample_rate,
     CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, CHATTERBOX_TURBO_DEFAULT_TOP_P,
     CHATTERBOX_TURBO_DEFAULT_TOP_K, CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY,
@@ -269,23 +271,52 @@ def gen_audio_segments_chatterbox(bridge, text, stats=None, max_chunks=None,
                 print('Synthesis stopped by user.')
                 break
             chunk_path = Path(tmp_dir) / f'chunk_{idx:05d}.wav'
-            try:
-                result = bridge.generate(chunk, chunk_path, stop_event=stop_event)
-            except ChatterboxCancelled:
-                print('Synthesis stopped by user.')
+            
+            # Retry loop for degenerate chunks (too many tokens or too much silence)
+            chunk_retries = 0
+            while True:
+                try:
+                    result = bridge.generate(chunk, chunk_path, stop_event=stop_event)
+                except ChatterboxCancelled:
+                    print('Synthesis stopped by user.')
+                    break
+                write_sr = int(result.get('sample_rate') or write_sr)
+                if not chunk_path.is_file():
+                    raise ChatterboxError('Chatterbox did not write a chunk WAV.')
+                audio, _sr = soundfile.read(chunk_path, dtype='float32')
+                try:
+                    chunk_path.unlink()
+                except OSError:
+                    pass
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=1)
+                audio = _apply_fade(np.asarray(audio, dtype=np.float32))
+                
+                # Degenerate chunk detection
+                is_degenerate = False
+                token_count = result.get('speech_token_count')
+                if token_count is not None and token_count > CHATTERBOX_MAX_CHUNK_TOKENS:
+                    is_degenerate = True
+                    print(f'\nChunk {idx}: {token_count} tokens (>{CHATTERBOX_MAX_CHUNK_TOKENS}), retrying...')
+                # Silence ratio check
+                if audio.size > 0:
+                    silence_threshold = 0.005
+                    loud = np.flatnonzero(np.abs(audio) > silence_threshold)
+                    if loud.size > 0:
+                        silent_ratio = 1.0 - (loud[-1] - loud[0] + 1) / audio.size
+                        if silent_ratio > CHATTERBOX_MAX_CHUNK_SILENCE_RATIO:
+                            is_degenerate = True
+                            print(f'\nChunk {idx}: {silent_ratio*100:.1f}% silent (>{CHATTERBOX_MAX_CHUNK_SILENCE_RATIO*100:.0f}%), retrying...')
+                
+                if is_degenerate and chunk_retries < CHATTERBOX_CHUNK_MAX_RETRIES:
+                    chunk_retries += 1
+                    continue  # retry this chunk
+                
+                segments.append(audio)
+                break  # accept this chunk (either good, or max retries reached)
+            
+            if stop_event and stop_event.is_set():
                 break
-            write_sr = int(result.get('sample_rate') or write_sr)
-            if not chunk_path.is_file():
-                raise ChatterboxError('Chatterbox did not write a chunk WAV.')
-            audio, _sr = soundfile.read(chunk_path, dtype='float32')
-            try:
-                chunk_path.unlink()
-            except OSError:
-                pass
-            if audio.ndim > 1:
-                audio = audio.mean(axis=1)
-            audio = _apply_fade(np.asarray(audio, dtype=np.float32))
-            segments.append(audio)
 
             counted = len(chunk) + (separator_chars if idx == len(chunks) else 0)
             processed += counted

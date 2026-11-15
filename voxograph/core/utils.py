@@ -37,6 +37,24 @@ def _apply_fade(audio, fade_ms=5.0):
     return audio
 
 
+def _trim_silence(audio, threshold=0.005, min_keep_seconds=0.5):
+    """Drop near-silent head/tail from a generated audio segment.
+
+    Used to remove trailing silence tokens that Chatterbox Turbo emits
+    instead of the stop token. A no-op when the result would be shorter
+    than `min_keep_seconds`.
+    """
+    if audio.size == 0:
+        return audio
+    loud = np.flatnonzero(np.abs(audio) > threshold)
+    if loud.size == 0:
+        return audio
+    start, end = int(loud[0]), int(loud[-1]) + 1
+    if (end - start) < sample_rate * min_keep_seconds:
+        return audio
+    return audio[start:end]
+
+
 def _insert_silence_between(segments, silence_ms):
     """Join `segments` with `silence_ms` of zeros between each pair.
 

@@ -78,7 +78,8 @@ from voxograph.core.nlp import (
     load_spacy,
     set_espeak_library,
 )
-from voxograph.core.gemini import (
+from voxograph.core.ai import (
+    _ai_models_for,
     _ai_rewrite_single_chunk,
     _ai_split_paragraphs,
     _call_gemini_with_retry,
@@ -92,6 +93,11 @@ from voxograph.core.gemini import (
     correct_phonetics_ai,
     correct_phonetics_ai_chapters,
     iter_correct_phonetics_ai_chapters,
+)
+from voxograph.core.deepseek import (
+    DeepSeekAPIError,
+    _deepseek_generate,
+    _is_deepseek_model,
 )
 from voxograph.core.epub import (
     chapter_beginning_one_liner,
@@ -178,6 +184,7 @@ __all__ = [
     'VOICE_SAMPLE_TEXT_VERSION',
     'VOICE_SAMPLE_TRIM_THRESHOLD',
     'ai_provider_for_model',
+    'DeepSeekAPIError',
     'chapter_beginning_one_liner',
     'chatterbox_bridge_request',
     'check_phonetic_transcription_ai',

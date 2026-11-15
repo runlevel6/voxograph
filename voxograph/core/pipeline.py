@@ -26,10 +26,10 @@ from .constants import (
     CHATTERBOX_TURBO_TOP_K_RANGE, CHATTERBOX_TURBO_REPETITION_PENALTY_RANGE,
     CHUNK_SILENCE_MS,
 )
-from .utils import _clamp_float, _clamp_int, _clamp_unit_float, strfdelta, _insert_silence_between
+from .utils import _clamp_float, _clamp_int, _clamp_unit_float, strfdelta, _insert_silence_between, _trim_silence
 from .settings import load_settings, save_settings, is_chatterbox_model
 from .nlp import get_nlp, lang_code_from_voice, set_espeak_library
-from .gemini import (
+from .ai import (
     _api_key_problem, _iter_correct_phonetics_ai_pieces,
 )
 from .epub import (
@@ -464,6 +464,7 @@ def main(file_path, voice=None, pick_manually=False, speed=1, output_folder='.',
                 audio_segments = segments
 
             if audio_segments:
+                audio_segments = [_trim_silence(seg) for seg in audio_segments]
                 audio_segments = _insert_silence_between(audio_segments, CHUNK_SILENCE_MS)
                 final_audio = np.concatenate(audio_segments)
                 peak = np.abs(final_audio).max()

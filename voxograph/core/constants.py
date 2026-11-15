@@ -129,6 +129,16 @@ CHATTERBOX_MAX_CHUNK_CHARS = 300
 # before the run is ended with CORE_ERROR.
 CHATTERBOX_MAX_RETRIES = 3
 
+# Chunk-level degenerate detection (Turbo): if a chunk emits more tokens than
+# this threshold, it is likely stuck emitting silence tokens instead of the
+# stop token. ~600 tokens at 25 Hz ≈ 24 s of audio.
+CHATTERBOX_MAX_CHUNK_TOKENS = 600
+# If the generated chunk's silence ratio exceeds this, it is degenerate and
+# should be retried. 0.5 = 50% silence.
+CHATTERBOX_MAX_CHUNK_SILENCE_RATIO = 0.5
+# Max retries for a single degenerate chunk (distinct from bridge retries).
+CHATTERBOX_CHUNK_MAX_RETRIES = 2
+
 CHATTERBOX_BRIDGE_DIR = Path(
     os.environ.get('VOXOGRAPH_CHATTERBOX_BRIDGE_DIR', '/home/vlad/chatterbox_venv'))
 CHATTERBOX_BRIDGE_PYTHON = CHATTERBOX_BRIDGE_DIR / 'bin' / 'python3'
@@ -281,6 +291,7 @@ _QUOTA_ERROR_MARKERS = ('RESOURCE_EXHAUSTED', 'quota exceeded', 'QuotaFailure')
 # `retryDelay` longer than _QUOTA_DAILY_RETRY_DELAY_SECS as daily.
 _DAILY_QUOTA_ERROR_MARKERS = ('PerDay', 'per day', 'per_day')
 _QUOTA_DAILY_RETRY_DELAY_SECS = 600
+_QUOTA_RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
 
 # Hard ceiling on a single Gemini request. A watchdog thread prints a live
 # countdown while the call is in flight; if no response arrives in this window
@@ -303,8 +314,6 @@ GEMINI_MODELS = (
     "gemini-3-flash",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
 )
 
 # ---------------------------------------------------------------------------
