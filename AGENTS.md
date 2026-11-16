@@ -30,7 +30,7 @@
 Converts EPUB e-books into `.m4b` (plus intermediate per-chapter `.wav`) using Kokoro-82M, with
 **Chatterbox** (Multilingual V3 / Turbo) as an interchangeable second engine. wxPython GUI + CLI.
 9 languages, spaCy sentence segmentation, ffmpeg/ffprobe for encoding/duration, espeak-ng for
-phonemization, optional Gemini AI for phonetic correction.
+phonemization, optional Gemini **or DeepSeek** AI for phonetic correction.
 
 **Performance**: ~600 chars/s on a T4 (Kokoro); ~60 chars/s CPU-only.
 
@@ -48,20 +48,20 @@ phonemization, optional Gemini AI for phonetic correction.
 | `voices.py` | 27 | Voice table keyed by lang code + flag emoji. |
 | `voice_samples_cli.py` | 110 | Headless Chatterbox preset builder (`--list/--voice/--lang/--all`). |
 | `config.json` | — | Runtime settings, **gitignored** (holds the API key). |
-| `core/` | 3380 | Engine/pipeline package (see §4.2). |
-| `ui/` | 1580 | wxPython GUI package (see §4.3). |
+| `core/` | 4014 | Engine/pipeline package (see §4.2). |
+| `ui/` | 1652 | wxPython GUI package (see §4.3). |
 
-`core/` = `__init__.py` 220 (re-exports 74 public names, so `import voxograph.core as core` and
-`from voxograph.core import X` are the stable surface) · `constants.py` 430 · `utils.py` 48 ·
-`settings.py` 102 · `text.py` 171 · `nlp.py` 86 · `gemini.py` 839 · `epub.py` 117 · `audio.py` 254 ·
-`voice_samples.py` 185 · `pipeline.py` 478 (holds `main`) · `tts/{kokoro 56, chunking 96,
-chatterbox 281}`.
+`core/` = `__init__.py` 229 (re-exports 75 public names, so `import voxograph.core as core` and
+`from voxograph.core import X` are the stable surface) · `constants.py` 515 · `utils.py` 82 ·
+`settings.py` 118 · `text.py` 171 · `nlp.py` 86 · `ai.py` 984 · `gemini.py` 74 · `deepseek.py` 113 ·
+`epub.py` 141 · `audio.py` 270 · `voice_samples.py` 185 · `pipeline.py` 543 (holds `main`) ·
+`tts/{kokoro 73, chunking 96, chatterbox 354}`.
 
 `ui/` = `__init__.py` 25 (re-exports `main`, `MainWindow`, `EVENTS`, `CoreThread`,
 `_extract_bridge_json`, `border`, `BOOK_DETAILS_WRAP_WIDTH`) · `events.py` 16 · `bridge.py` 24 ·
 `window.py` 59 · `core_thread.py` 20 · `app.py` 15 · `__main__.py` 5 · mixins `menu` 53,
-`layout` 166, `params` 373, `ref_audio` 170, `voice_samples` 135, `settings` 61, `ebook` 119,
-`preview` 197, `synthesis` 77, `core_events` 65.
+`layout` 166 · `params` 417 · `ref_audio` 170 · `voice_samples` 135 · `settings` 88 · `ebook` 119 ·
+`preview` 198 · `synthesis` 77 · `core_events` 65.
 
 `MainWindow` is assembled in `ui/window.py` from the mixins; `super().__init__` still reaches
 `wx.Frame`. One cohesive method group per module.
@@ -144,11 +144,20 @@ because the module moved one level deeper) · `DEFAULT_VOICE = 'af_heart'`. Voic
 0.8, TOP_P = 0.95, TOP_K = 1000, REPETITION_PENALTY = 1.2}` with their `CHATTERBOX_TURBO_*_RANGE`
 bounds (drives both the spinners and the clamping) · `CHATTERBOX_MODEL_{MULTILINGUAL,TURBO}` /
 `CHATTERBOX_MODELS` / `CHATTERBOX_DEFAULT_MODEL = 'multilingual'` · `CHATTERBOX_MAX_CHUNK_CHARS =
-300` · `CHATTERBOX_MAX_RETRIES = 3` · `CHATTERBOX_BRIDGE_{DIR,PYTHON,SCRIPT}` (dir from
+300` · `CHATTERBOX_TURBO_MAX_GEN_LEN = 1000` (Turbo's `inference_turbo` step cap) ·
+`CHATTERBOX_MAX_CHUNK_TOKENS = 1000` (== that cap: only a chunk that never emitted the stop token is
+degenerate) · `CHATTERBOX_MAX_CHUNK_SILENCE_RATIO = 0.5` · `CHATTERBOX_CHUNK_MAX_RETRIES = 2` ·
+`CHATTERBOX_MAX_RETRIES = 3` · `CHATTERBOX_BRIDGE_{DIR,PYTHON,SCRIPT}` (dir from
 `VOXOGRAPH_CHATTERBOX_BRIDGE_DIR`) · `CHATTERBOX_T3_MODEL` / `CHATTERBOX_LANGUAGE_ID` /
 `_CHATTERBOX_NOISE_MARKERS` · `_SENTENCE_BOUNDARY_RE` / `_CLAUSE_BOUNDARY_RE`. Text cleaning:
 `ABBREVIATIONS` + compiled `_ABBREV_PATTERNS` · `_ROMAN_RE_SRC` / `_ROMAN_HEADING_RE` /
-`_ROMAN_KEYWORD_RE`. Gemini: `GEMINI_MODELS`, the three rule strings (`_PHONETIC_RULES` /
+`_ROMAN_KEYWORD_RE`. AI: `GEMINI_MODELS` (the 11-model ordered fallback list, newest first) /
+`DEFAULT_GEMINI_MODEL = 'gemini-flash'` — the **single Gemini sentinel exposed in the GUI** (not a
+real model name; `_ai_models_for()` resolves it to `GEMINI_MODELS` at request time) ·
+`AI_MODEL_CHOICES = (DEFAULT_GEMINI_MODEL,) + DEEPSEEK_MODELS` · `AI_PROVIDER_{GEMINI,DEEPSEEK}` /
+`DEFAULT_AI_PROVIDER`, `DEEPSEEK_MODELS` (`deepseek-flash`, `deepseek-v4-pro`) /
+`DEEPSEEK_DEFAULT_MODEL`, `DEEPSEEK_API_BASE` / `DEEPSEEK_CHAT_COMPLETIONS_URL`,
+`_DEEPSEEK_{MAX_OUTPUT_TOKENS,REQUEST_TIMEOUT_SECS}`, the three rule strings (`_PHONETIC_RULES` /
 `_CHATTERBOX_PHONETIC_RULES` / `_CHATTERBOX_TAG_RULES`), `_AI_MAX_OUTPUT_TOKENS`,
 `_GEMINI_RETRY_DELAYS_SECS` / `_GEMINI_REQUEST_TIMEOUT_{SECS,MS}` · `_NON_RETRYABLE_ERROR_MARKERS`,
 the `_AI_REWRITE_*` / `_AI_MIN_*` sizing, `_AI_{PARAGRAPH,SENTENCE,CLAUSE}_BREAK_RE` and
@@ -162,8 +171,9 @@ default)` / `_clamp_int(value, low, high, default)` (range clamp, used by the Tu
 `strfdelta(tdelta, fmt)`.
 
 **`settings.py`** — `is_chatterbox_model(value)` · `load_settings()` (`.setdefault` migration for
-every key, so old configs load, then `_clamp_turbo_settings()` normalizes the Turbo knobs) ·
-`save_settings(...)` (one big explicit signature; the single source of truth, imported by the UI).
+every key, so old configs load, then `_clamp_turbo_settings()` normalizes the Turbo knobs; any stale
+concrete Gemini model name is normalized to the `gemini-flash` sentinel) · `save_settings(...)` (one big
+explicit signature; the single source of truth, imported by the UI).
 
 **`text.py`** — Roman numeral expansion (`_roman_to_int` / `_int_to_words` /
 `_roman_match_to_words` / `expand_roman_numerals`) — only valid numerals 1–3999, ALL-CAPS preserved
@@ -183,41 +193,46 @@ content tags are emitted once instead of the parent's `.text` duplicating them, 
 `clean_text`) · `is_chapter()` · `find_good_chapters()`
 · `pick_chapters()` · `print_selected_chapters()` · `chapter_beginning_one_liner()`.
 
-**`gemini.py`** (839 lines) — its constants and rule strings live in `constants.py`; the module
-holds the retry/rewrite logic. `GEMINI_MODELS` (11 models newest-first) + `_try_gemini_models()`,
-the default fallback path (`use_model_fallback=True` on every public AI entry point): each model is
-tried in turn — a daily-quota-exhausted model is skipped **immediately** (the free-tier quota is
-enforced per model, so the remaining models are still tried; if every model is out of daily quota the
-run gives up at once instead of waiting for a reset hours away), while any other busy/unavailable
-model (e.g. 503) waits 1 minute and is retried once before the next model is tried. Only when **all**
-models fail a pass does the whole list wait the backoff schedule (1/2/3/4 min) and retry (5 rounds).
-Non-retryable errors (bad key, permission, NOT_FOUND, UNAUTHENTICATED, INVALID_ARGUMENT) abort at
-once, since they are not model-specific. A model that produces no response within
-`_GEMINI_REQUEST_TIMEOUT_SECS`=180s is abandoned (`GeminiTimeoutError`, which has no non-retryable
-marker so it fails over) and the next model is tried · `_call_gemini_with_timeout()` runs each call
-in a daemon worker thread, prints a per-second `[Gemini] <model>: waiting for response, Ns left`
-countdown, and raises on expiry; `_gemini_client()` builds the SDK client with
-`http_options=types.HttpOptions(timeout=_GEMINI_REQUEST_TIMEOUT_MS=180000)` so a hung request is
-aborted socket-side too. Prints `[Gemini] …` diagnostics for each attempt/failure/timeout/round ·
-`_call_gemini_with_retry()` (still used when `use_model_fallback=False`: waits a minute on
-503/high-demand, posts `CORE_AI_RETRY_EXHAUSTED` when it gives up) · every `generate_content` call passes
-`config=_ai_generate_config()`, i.e. `GenerateContentConfig(max_output_tokens=_AI_MAX_OUTPUT_TOKENS
-=65536)`, to override the SDK/model default · `_ai_rewrite_single_chunk()` /
-`_ai_split_paragraphs()` / `_ai_split_overlong()` / `_ai_split_hard()` / `_extract_rewritten_section()` · `correct_phonetics_ai()` (rewrites one
-chapter) · `_rewrite_packed_unit()` (one packed request) · `_iter_correct_phonetics_ai_pieces()`
-(internal generator the pipeline drives: same packing, but yields **every rewritten piece** as it
-comes back as `(chapter_index, piece, is_last_piece)`, so a long chapter can start being spoken
-after its first fragment instead of after all ~dozen of its units) · `iter_correct_phonetics_ai_chapters()`
-(public generator: wraps the piece generator and yields each chapter only once all its pieces are
-rewritten, joining them with `\n\n` — unchanged external contract) · `correct_phonetics_ai_chapters()`
-(eager `dict()` wrapper around the public generator) ·
-`check_phonetic_transcription_ai()` (check-only) · `_phonetic_rules_for(tts_engine,
-chatterbox_model)` selects `_PHONETIC_RULES` (Kokoro: inline IPA `[text](/kˈOkəɹO/)`, stress
-`(-1)`/`(+1)`, `[[espeak phonemes]]`) vs `_CHATTERBOX_PHONETIC_RULES` (plain-English respelling
-only) — for **Chatterbox Turbo only** it appends `_CHATTERBOX_TAG_RULES`, the 19 expressive tags
-(9 vocal effects + 10 emotion/delivery styles) the Turbo tokenizer knows, so one AI pass does
-pronunciation + tag insertion; Multilingual V3 gets no tag rules · `_is_retryable_gemini_error()`,
-`_NON_RETRYABLE_ERROR_MARKERS`, `_sanitize_api_key()`, `_sleep_with_stop_event()`.
+**`ai.py`** (984 lines) — provider-agnostic AI processing. Owns `ai_provider_for_model()` /
+`_ai_models_for()` / `_ai_generate_content()` (dispatch to the provider module), key handling
+(`_sanitize_api_key()`, `_api_key_problem()`), the timeout/fallback/retry machinery
+(`AITimeoutError`, aliased as `GeminiTimeoutError`; `_call_gemini_with_timeout()`,
+`_try_gemini_models(models=...)`, `_is_daily_quota_error()`, `_EXHAUSTED_MODELS`,
+`_call_gemini_with_retry()`, `_sleep_with_stop_event()`), `_phonetic_rules_for()`, and the entire
+rewrite pipeline (`check_phonetic_transcription_ai`, `_ai_split_*`, `_ai_take_prefix`,
+`_ai_pack_units`, `correct_phonetics_ai`, `_rewrite_packed_unit`,
+`_iter_correct_phonetics_ai_pieces`, `iter_correct_phonetics_ai_chapters`,
+`correct_phonetics_ai_chapters`, `_ai_rewrite_single_chunk`, `_extract_rewritten_section`).
+`_try_gemini_models()` is the default fallback path (`use_model_fallback=True` on every public
+entry point): each model is tried in turn — a daily-quota-exhausted model is skipped **immediately**
+(quota is per model, so the rest are still tried; if every model is out, the run gives up at once),
+while any other busy/unavailable model (e.g. 503) waits 1 minute and is retried once before moving
+on. Only when **all** models fail a pass does the list wait the backoff schedule (1/2/3/4 min, 5
+rounds). Non-retryable errors abort at once. A model that produces no response within
+`_GEMINI_REQUEST_TIMEOUT_SECS`=180s raises `AITimeoutError` (no non-retryable marker, so it fails
+over); `_call_gemini_with_timeout()` runs each call in a daemon worker thread with a live
+`[AI] <model>: waiting for response` progress bar. `_phonetic_rules_for(tts_engine,
+chatterbox_model)` selects `_PHONETIC_RULES` (Kokoro: inline IPA, stress `(-1)`/`(+1)`) vs
+`_CHATTERBOX_PHONETIC_RULES` (plain-English respelling only) — for **Chatterbox Turbo only** it
+appends `_CHATTERBOX_TAG_RULES`, the 19 expressive tags the Turbo tokenizer knows.
+
+**`gemini.py`** (74 lines) — Gemini-specific code only: `_gemini_client()` builds `genai.Client`
+with `http_options=types.HttpOptions(timeout=_GEMINI_REQUEST_TIMEOUT_MS=180000)`;
+`_ai_generate_config()` returns `GenerateContentConfig(max_output_tokens=_AI_MAX_OUTPUT_TOKENS
+=20000, automatic_function_calling=...disable=True)` (also suppresses the SDK AFC warning);
+`gemini_models_for()` returns the ordered `GEMINI_MODELS` list; `_gemini_generate()` performs one
+no-tools `client.models.generate_content()` call. The AFC-through-a-Chat-session guidance comment
+lives here.
+
+**`deepseek.py`** (113 lines) — DeepSeek-specific code only. Owns the OpenAI-compatible Chat
+Completions call: `_deepseek_generate()` posts `POST {DEEPSEEK_CHAT_COMPLETIONS_URL}` with
+`thinking: {type: disabled}`, `_DEEPSEEK_MAX_OUTPUT_TOKENS` max output, and Bearer auth, raising
+`DeepSeekAPIError` on HTTP errors and `_AIResponse` on success. `_deepseek_error_detail()` parses
+the error body. `_DEEPSEEK_NON_RETRYABLE_STATUS` is the 400/401/402/403/404/422 set that aborts
+the fallback at once. `_is_deepseek_model()` identifies the provider by model name;
+`deepseek_models_for(model)` returns the requested model first, then the remaining
+`DEEPSEEK_MODELS`. `ai._is_retryable_gemini_error()` checks `isinstance(exc, DeepSeekAPIError)`
+against the status set defined here.
 
 **`audio.py`** — `_popen_run(args, stop_event, on_stderr_line)` — interruptible `subprocess.run`
 with drain threads (avoids the 64 KB pipe-buffer deadlock) · `create_m4b()` (concat demuxer,
@@ -255,7 +270,12 @@ polls `stop_event` every 250 ms, `close()` terminates the child; carries `device
 `turbo_repetition_penalty`) · `gen_audio_segments_chatterbox()` (per-chunk temp WAV →
 mono float32 → `_apply_fade`, updates stats/ETA from measured throughput, posts `CORE_PROGRESS`,
 restores separator chars on the last chunk so progress reaches 100 %) ·
-`_is_chatterbox_progress_noise()` / `_CHATTERBOX_NOISE_MARKERS`.
+`_is_chatterbox_progress_noise()` / `_CHATTERBOX_NOISE_MARKERS`. Each Turbo chunk is checked for
+degeneration after generation: a `speech_token_count` at Turbo's generation cap
+(`CHATTERBOX_MAX_CHUNK_TOKENS = 1000`, i.e. no stop token was ever emitted) or a silence ratio above
+`CHATTERBOX_MAX_CHUNK_SILENCE_RATIO` retries that chunk up to `CHATTERBOX_CHUNK_MAX_RETRIES = 2`
+times, then accepts it with an explicit "accepting after 2 retries" line. Token count is a duration
+proxy (25 tokens/s), not a quality signal — see §10, 2026-11-16.
 
 **`tts/kokoro.py`** — `gen_audio_segments()` (spaCy sentences → `KPipeline`, 5 ms fades, stats,
 `stop_event`, `max_sentences` with `>=` — Fix #3) · `gen_text()` (one-shot TTS to WAV).
@@ -270,7 +290,7 @@ and drives the lazy `_iter_correct_phonetics_ai_pieces()` generator → per chap
 existing WAVs, skips <10 chars, and for a chapter with an AI rewrite pulls and **synthesizes each
 rewritten fragment in turn**, appending to that chapter's audio buffer, then writes the WAV when the
 chapter's last fragment arrives; the next `next()` after a fragment is spoken triggers the next
-Gemini request — so AI and TTS interleave AI→TTS→AI→TTS **inside** a long chapter too, instead of
+AI request — so AI and TTS interleave AI→TTS→AI→TTS **inside** a long chapter too, instead of
 waiting for its whole rewrite (a 300K-char chapter is ~10 units) → prepends
 title/author to the first piece of chapter 1 → concatenates, peak-normalizes to 0.708, writes WAV →
 builds the index + M4B → deletes WAVs →
@@ -292,7 +312,8 @@ from `core.constants`; `EVENTS` (wx objects) is the only constant that stays her
 right column is a `ScrolledPanel` so tall parameter stacks stay reachable, and boxes are added with
 proportion `0` so they hug their content — only the params box takes the slack) · `params`
 (TTS engine Kokoro/Chatterbox, Chatterbox model dropdown, compute device, voice dropdown,
-engine-specific style rows, voice source + ref audio, output folder) · `ref_audio` (select/clear,
+engine-specific style rows, voice source + ref audio, AI model dropdown with Gemini + DeepSeek
+choices and per-provider API keys, output folder) · `ref_audio` (select/clear,
 stale-path detection, hint text) · `voice_samples` (build one / build all) · `settings`
 (`save_current_settings()` round-trip) · `ebook` (open EPUB, metadata, chapter table) · `preview`
 (engine dispatch + `ffplay`) · `synthesis` (start/cancel, progress, ETA, relayout) · `core_events`
@@ -310,6 +331,11 @@ cloned, so no `.wav` path is managed by hand. Chatterbox has no speed control, s
 `✓ Cloning: <file>` or a `⚠` what-is-missing message. A Chatterbox preview with no clone source
 offers to build the preset (then resumes the preview) or pick a WAV instead of dead-ending.
 
+**AI model dropdown** — lists the single Gemini sentinel `gemini-flash` plus the two DeepSeek models
+(`deepseek-flash`, `deepseek-v4-pro`). The sentinel is not a real model name: `_ai_models_for()`
+resolves it to the full ordered `GEMINI_MODELS` list at request time, so the fallback still tries
+every flash/flash-lite model top-down exactly as before — the user only picks *which provider*.
+
 **`CoreThread`** — background thread calling `core.main()`, posting back via `wx.PostEvent`.
 
 ---
@@ -326,8 +352,11 @@ CWD does not matter.
 | `voice` | voice code | shared by both engines — for Chatterbox it names the voice preset |
 | `speed` | 0.5–2.0 | Kokoro playback speed (Kokoro only; Chatterbox has none) |
 | `gemini_api_key` | `"AIza…"` | **secret — never commit or paste** |
-| `gemini_model` | str | default `gemini-3.1-flash-lite` |
-| `gemini_enabled` | bool | AI phonetic check on/off |
+| `gemini_model` | str | default `gemini-flash` — a **sentinel**, not a real model; the app resolves it to the ordered `GEMINI_MODELS` list and tries each flash/flash-lite model in turn (newest first) until one responds |
+| `gemini_enabled` | bool | AI phonetic check on/off (applies to either provider) |
+| `ai_provider` | `gemini` \| `deepseek` | last selected AI provider |
+| `deepseek_api_key` | `"sk-…"` | **secret — never commit or paste** |
+| `deepseek_model` | str | default `deepseek-flash` (DeepSeek V4.1 Flash) |
 | `last_open_dir` | path | file-dialog start dir |
 | `tts_engine` | `kokoro` \| `chatterbox` | which engine synthesizes *and* previews |
 | `chatterbox_ref_audio` | path | custom clone source, used only when source = `custom` |
@@ -437,6 +466,85 @@ There is **no test suite** — verification is `py_compile`, import smoke checks
 ---
 
 ## 10. Recent Changes
+
+- **2026-11-16 — Turbo "degenerate chunk" retries no longer fire on normal chunks.** The
+  degenerate-chunk guard added in `fe8cad7` treated any Turbo chunk over `CHATTERBOX_MAX_CHUNK_TOKENS
+  = 600` as stuck. But S3 speech tokens are 25/s (`chatterbox/models/s3tokenizer/s3tokenizer.py`),
+  and this project's Kokoro-preset voices read at ~10.4 chars/s ⇒ **2.41 tokens per char** (measured
+  from the 18 finished `End of the World` Turbo WAVs: 102,712 chars / 9,919 s). A 600-token cap is
+  therefore only ~250 chars, while `split_chatterbox_text` packs chunks up to 300 chars (254 avg in
+  that book): **1,161 of 1,772 chunks (66%) tripped the guard**, so nearly every chunk was generated
+  3× (1 + 2 retries) for audio that was fine, inflating the ETA to ~17 h. Regenerating the same text
+  cannot meaningfully shorten it either — the log showed 744 → 707 → 658 tokens, still over 600.
+  A truly stuck chunk has a precise signature: `T3.inference_turbo` runs at most
+  `max_gen_len` = 1000 steps and returns exactly 1000 tokens when it never emits the stop token
+  (6562), while a normal chunk stops earlier (≤ 999; observed 658–924). New
+  `CHATTERBOX_TURBO_MAX_GEN_LEN = 1000` and `CHATTERBOX_MAX_CHUNK_TOKENS` now aliases it, and the
+  check is `>=`; the silence-ratio check remains the second degeneration signal. The retry log was
+  also misleading: it printed one "retrying..." line per degenerate attempt, including the final
+  one that was then accepted, so a 2-retry limit looked like 3 retries. It now prints
+  `retrying (1/2)…` / `retrying (2/2)…` and `accepting after 2 retries.` separately. Verified:
+  `compileall` clean, `core`/`ui` imports clean, and a stubbed bridge test showed an 800-token chunk
+  generates once, a 1000-token chunk is retried exactly `CHATTERBOX_CHUNK_MAX_RETRIES` times then
+  accepted, and a result without `speech_token_count` (Multilingual V3) never retries.
+
+- **2026-11-15 — Provider-agnostic AI code moved to a new `core/ai.py`.** The general half of
+  `gemini.py` (dispatch `ai_provider_for_model` / `_ai_models_for` / `_ai_generate_content`, key
+  handling, timeout/fallback/retry, `_phonetic_rules_for`, and the entire rewrite pipeline) was
+  moved verbatim into `voxograph/core/ai.py`, leaving `gemini.py` (74 lines) as Gemini-only
+  (`_gemini_client`, `_ai_generate_config`, `gemini_models_for`, `_gemini_generate`) and
+  `deepseek.py` (113 lines) as DeepSeek-only (its dispatch helper is now `deepseek_models_for`).
+  `gemini.py` no longer imports `deepseek`, and `deepseek.py` no longer imports `gemini`, so the
+  provider modules are leaves; `ai.py` imports both. `GeminiTimeoutError` is now an alias of
+  `AITimeoutError` (same class, generalized name). The quota `retryDelay` regex moved to
+  `constants.py` as `_QUOTA_RETRY_DELAY_RE`; module-level run state (`_EXHAUSTED_MODELS`) stays in
+  `ai.py`. `core/__init__.py` re-exports the general names from `ai`; `pipeline.py` imports
+  `_api_key_problem` / `_iter_correct_phonetics_ai_pieces` from `.ai`. Verified: `compileall`
+  clean, `core`/`ui` imports clean, every `core.__all__` name resolves, `_ai_models_for('gemini-flash')`
+  returns the full `GEMINI_MODELS` list and `_ai_models_for('deepseek-flash')` the DeepSeek order.
+
+- **2026-11-15 — DeepSeek provider split into its own `core/deepseek.py` module.** The DeepSeek
+  half of `core/gemini.py` (`_AIResponse`, `DeepSeekAPIError`, `_DEEPSEEK_NON_RETRYABLE_STATUS`,
+  `_is_deepseek_model`, `_ai_models_for`, `_deepseek_error_detail`, `_deepseek_generate`, plus the
+  `json`/`urllib` imports and the `DEEPSEEK_*` constants) was moved verbatim into
+  `voxograph/core/deepseek.py`. The dispatch glue (`_ai_generate_content`, `_api_key_problem`,
+  `ai_provider_for_model`) stays in `gemini.py`, which imports the DeepSeek names from
+  `deepseek.py`; `deepseek.py` itself imports `GEMINI_MODELS` lazily inside `_ai_models_for` to
+  avoid a `gemini` → `deepseek` → `gemini` cycle. `core/__init__.py` re-exports
+  `DeepSeekAPIError` / `_ai_models_for` / `_deepseek_generate` / `_is_deepseek_model` from
+  `deepseek` alongside the Gemini names; `core/pipeline.py`'s `from .gemini import (...)` is
+  unchanged. Verified: `compileall` clean, `core`/`ui` imports clean, every `core.__all__` name
+  resolves, `ai_provider_for_model`/`_ai_models_for` dispatch unchanged.
+
+- **2026-11-15 — Gemini model dropdown reduced to one entry.** The GUI AI Model dropdown previously
+  listed five concrete Gemini model names (`gemini-3.1-flash-lite`, `gemini-3.5-flash`,
+  `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-flash-lite-latest`) plus the two DeepSeek models.
+  It now lists a single Gemini sentinel, `gemini-flash`, alongside `deepseek-flash` /
+  `deepseek-v4-pro`. The sentinel is not a real model name: `_ai_models_for('gemini-flash')`
+  resolves it to the full ordered `GEMINI_MODELS` list (11 models, newest first), so the fallback
+  still tries every flash/flash-lite model in turn exactly as before — skipping daily-quota-exhausted
+  models immediately, giving each remaining model one 180s attempt, and only after all fail running the
+  1/2/3/4-minute backoff rounds. The user only picks *which provider*. `DEFAULT_GEMINI_MODEL` is now
+  `gemini-flash`; `AI_MODEL_CHOICES = (DEFAULT_GEMINI_MODEL,) + DEEPSEEK_MODELS`; `load_settings()`
+  normalizes any stale concrete model name to the sentinel on load; the default `model=` args and
+  the 404 error suggestion in `core/gemini.py` were updated; the dropdown tooltip explains the sentinel.
+  Verified: `compileall` clean, `core`/`ui` imports clean, `load_settings()` returns `gemini-flash`,
+  `_ai_models_for('gemini-flash')` returns the full `GEMINI_MODELS` list, and
+  `ai_provider_for_model` routes the sentinel to Gemini.
+
+- **2026-11-15 — DeepSeek V4.1 Flash as an AI provider option.** The AI Phonetic Check can now run
+  on `deepseek-flash` — the DeepSeek V4.1 Flash model the local Kilo Code instance uses — as well as
+  Gemini. The GUI model dropdown lists `deepseek-flash` / `deepseek-v4-pro`, the key field follows the
+  selected provider and each provider keeps its own saved key/model, and core routes by model name.
+  DeepSeek uses the OpenAI-compatible `POST https://api.deepseek.com/chat/completions` endpoint via
+  stdlib `urllib` (no new dependency), disables thinking mode, caps output at 20K tokens, and shares
+  the existing fallback/timeout/retry machinery (`_try_gemini_models(models=...)`); non-retryable
+  DeepSeek 400/401/402/403/404/422 errors abort immediately. Settings gained `ai_provider`,
+  `deepseek_api_key`, `deepseek_model`; `DEEPSEEK_API_BASE` can be overridden with
+  `VOXOGRAPH_DEEPSEEK_API_BASE`. Verified: compileall + core/UI imports clean; headless params-panel
+  construction; per-provider key/model swap and save; stubbed DeepSeek request (model, thinking,
+  max_tokens, auth), 503 failover, 401 abort, and a DeepSeek rewrite through
+  `_iter_correct_phonetics_ai_pieces`.
 
 - **2026-10-21 — Gemini quota skipping, CUDA allocator fix for Turbo, larger AI requests, tidier
   progress output** (previously left uncommitted from the sessions that produced the 2026-10-18

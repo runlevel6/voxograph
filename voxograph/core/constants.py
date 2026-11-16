@@ -26,7 +26,7 @@ _AAC_ENCODE_RT_FACTOR = 50    # ffmpeg aac runs ~50x realtime
 
 # Silence (ms) inserted between synthesized chunks so the join does not sound
 # like one breathless run-on sentence. 400 ms is a natural short-pause beat.
-CHUNK_SILENCE_MS = 400
+CHUNK_SILENCE_MS = 300
 
 # Fix #10: use path relative to this file so it resolves consistently
 # regardless of where the process is launched from.
@@ -129,10 +129,18 @@ CHATTERBOX_MAX_CHUNK_CHARS = 300
 # before the run is ended with CORE_ERROR.
 CHATTERBOX_MAX_RETRIES = 3
 
-# Chunk-level degenerate detection (Turbo): if a chunk emits more tokens than
-# this threshold, it is likely stuck emitting silence tokens instead of the
-# stop token. ~600 tokens at 25 Hz ≈ 24 s of audio.
-CHATTERBOX_MAX_CHUNK_TOKENS = 600
+# Chatterbox Turbo's T3 decoder runs at most this many speech-token steps per
+# chunk (chatterbox `T3.inference_turbo(..., max_gen_len=1000)`). A chunk that
+# never emits the stop token runs the whole loop and comes back with exactly
+# this many tokens; anything shorter stopped normally.
+CHATTERBOX_TURBO_MAX_GEN_LEN = 1000
+# Chunk-level degenerate detection (Turbo): a chunk is degenerate only when it
+# hits Turbo's generation cap, i.e. it never emitted the stop token and padded
+# the tail with garbage/silence. This is NOT a duration limit: S3 speech tokens
+# are 25/s, and a 300-char chunk legitimately runs ~500-900 tokens (~20-36 s)
+# at a normal speaking pace, so any lower threshold would flag most of a book
+# and triple synthesis time for audio that is fine.
+CHATTERBOX_MAX_CHUNK_TOKENS = CHATTERBOX_TURBO_MAX_GEN_LEN
 # If the generated chunk's silence ratio exceeds this, it is degenerate and
 # should be retried. 0.5 = 50% silence.
 CHATTERBOX_MAX_CHUNK_SILENCE_RATIO = 0.5

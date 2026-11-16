@@ -292,12 +292,18 @@ def gen_audio_segments_chatterbox(bridge, text, stats=None, max_chunks=None,
                     audio = audio.mean(axis=1)
                 audio = _apply_fade(np.asarray(audio, dtype=np.float32))
                 
-                # Degenerate chunk detection
+                # Degenerate chunk detection. The token count is a duration
+                # proxy (25 tokens/s), not a quality signal, so only a chunk
+                # that ran into Turbo's generation cap is degenerate: it never
+                # emitted the stop token and padded the tail with garbage.
                 is_degenerate = False
+                degenerate_reason = ''
                 token_count = result.get('speech_token_count')
-                if token_count is not None and token_count > CHATTERBOX_MAX_CHUNK_TOKENS:
+                if token_count is not None and token_count >= CHATTERBOX_MAX_CHUNK_TOKENS:
                     is_degenerate = True
-                    print(f'\nChunk {idx}: {token_count} tokens (>{CHATTERBOX_MAX_CHUNK_TOKENS}), retrying...')
+                    degenerate_reason = (f'{token_count} tokens (hit the '
+                                         f'{CHATTERBOX_MAX_CHUNK_TOKENS}-token '
+                                         f'cap, no stop token)')
                 # Silence ratio check
                 if audio.size > 0:
                     silence_threshold = 0.005
@@ -306,12 +312,19 @@ def gen_audio_segments_chatterbox(bridge, text, stats=None, max_chunks=None,
                         silent_ratio = 1.0 - (loud[-1] - loud[0] + 1) / audio.size
                         if silent_ratio > CHATTERBOX_MAX_CHUNK_SILENCE_RATIO:
                             is_degenerate = True
-                            print(f'\nChunk {idx}: {silent_ratio*100:.1f}% silent (>{CHATTERBOX_MAX_CHUNK_SILENCE_RATIO*100:.0f}%), retrying...')
-                
-                if is_degenerate and chunk_retries < CHATTERBOX_CHUNK_MAX_RETRIES:
-                    chunk_retries += 1
-                    continue  # retry this chunk
-                
+                            degenerate_reason = (
+                                f'{silent_ratio*100:.1f}% silent '
+                                f'(>{CHATTERBOX_MAX_CHUNK_SILENCE_RATIO*100:.0f}%)')
+
+                if is_degenerate:
+                    if chunk_retries < CHATTERBOX_CHUNK_MAX_RETRIES:
+                        chunk_retries += 1
+                        print(f'\nChunk {idx}: {degenerate_reason}, retrying '
+                              f'({chunk_retries}/{CHATTERBOX_CHUNK_MAX_RETRIES})...')
+                        continue  # retry this chunk
+                    print(f'\nChunk {idx}: {degenerate_reason}, accepting after '
+                          f'{CHATTERBOX_CHUNK_MAX_RETRIES} retries.')
+
                 segments.append(audio)
                 break  # accept this chunk (either good, or max retries reached)
             
