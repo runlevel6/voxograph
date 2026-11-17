@@ -55,6 +55,40 @@ def _trim_silence(audio, threshold=0.005, min_keep_seconds=0.5):
     return audio[start:end]
 
 
+def _compress_internal_silence(audio, threshold=0.005, max_silence_ms=1000,
+                               target_ms=400):
+    """Shorten near-silent runs longer than `max_silence_ms` to `target_ms`.
+
+    Chatterbox Turbo can emit multi-second near-silence in the middle of a
+    chunk. `_trim_silence` only removes head/tail silence, so those gaps would
+    survive into the chapter WAV as dead air. Shortening them keeps the speech
+    on both sides while leaving natural pauses (<= `max_silence_ms`) untouched.
+    """
+    if audio.size == 0:
+        return audio
+    max_len = int(sample_rate * max_silence_ms / 1000.0)
+    keep_len = int(sample_rate * target_ms / 1000.0)
+    if max_len <= keep_len:
+        return audio
+    silent = np.abs(audio) <= threshold
+    padded = np.concatenate(([False], silent, [False]))
+    edges = np.flatnonzero(np.diff(padded.astype(np.int8)))
+    starts, ends = edges[0::2], edges[1::2]
+    if starts.size == 0:
+        return audio
+    pieces = []
+    prev = 0
+    for start, end in zip(starts, ends):
+        if end - start <= max_len:
+            continue
+        pieces.append(audio[prev:start + keep_len])
+        prev = end
+    if not pieces:
+        return audio
+    pieces.append(audio[prev:])
+    return np.concatenate(pieces)
+
+
 def _insert_silence_between(segments, silence_ms):
     """Join `segments` with `silence_ms` of zeros between each pair.
 

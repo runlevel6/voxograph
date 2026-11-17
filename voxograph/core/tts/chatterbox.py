@@ -19,7 +19,8 @@ from ..constants import (
     CHATTERBOX_DEFAULT_MODEL, CHATTERBOX_LANGUAGE_ID, CHATTERBOX_T3_MODEL,
     CHATTERBOX_CUDA_ALLOC_CONF,
     CHATTERBOX_MAX_CHUNK_TOKENS, CHATTERBOX_MAX_CHUNK_SILENCE_RATIO,
-    CHATTERBOX_CHUNK_MAX_RETRIES,
+    CHATTERBOX_CHUNK_MAX_RETRIES, CHATTERBOX_SILENCE_THRESHOLD,
+    CHATTERBOX_MAX_INTERNAL_SILENCE_MS, CHATTERBOX_INTERNAL_SILENCE_TARGET_MS,
     _CHATTERBOX_NOISE_MARKERS, sample_rate,
     CHATTERBOX_TURBO_DEFAULT_TEMPERATURE, CHATTERBOX_TURBO_DEFAULT_TOP_P,
     CHATTERBOX_TURBO_DEFAULT_TOP_K, CHATTERBOX_TURBO_DEFAULT_REPETITION_PENALTY,
@@ -27,7 +28,10 @@ from ..constants import (
     CHATTERBOX_TURBO_TOP_K_RANGE, CHATTERBOX_TURBO_REPETITION_PENALTY_RANGE,
 )
 from ..settings import is_chatterbox_model
-from ..utils import _clamp_float, _clamp_int, _clamp_unit_float, _apply_fade, strfdelta
+from ..utils import (
+    _clamp_float, _clamp_int, _clamp_unit_float, _apply_fade,
+    _compress_internal_silence, strfdelta,
+)
 from .chunking import split_chatterbox_text
 
 
@@ -304,17 +308,21 @@ def gen_audio_segments_chatterbox(bridge, text, stats=None, max_chunks=None,
                     degenerate_reason = (f'{token_count} tokens (hit the '
                                          f'{CHATTERBOX_MAX_CHUNK_TOKENS}-token '
                                          f'cap, no stop token)')
-                # Silence ratio check
-                if audio.size > 0:
-                    silence_threshold = 0.005
-                    loud = np.flatnonzero(np.abs(audio) > silence_threshold)
-                    if loud.size > 0:
-                        silent_ratio = 1.0 - (loud[-1] - loud[0] + 1) / audio.size
-                        if silent_ratio > CHATTERBOX_MAX_CHUNK_SILENCE_RATIO:
-                            is_degenerate = True
-                            degenerate_reason = (
-                                f'{silent_ratio*100:.1f}% silent '
-                                f'(>{CHATTERBOX_MAX_CHUNK_SILENCE_RATIO*100:.0f}%)')
+                # Silence ratio check (head/tail only; internal gaps are
+                # compressed below). A chunk with no audible samples at all is
+                # always degenerate — the old `loud.size > 0` guard skipped it,
+                # so a fully silent generation was accepted as-is.
+                loud = np.flatnonzero(np.abs(audio) > CHATTERBOX_SILENCE_THRESHOLD)
+                if loud.size == 0:
+                    is_degenerate = True
+                    degenerate_reason = 'entirely silent'
+                else:
+                    silent_ratio = 1.0 - (loud[-1] - loud[0] + 1) / audio.size
+                    if silent_ratio > CHATTERBOX_MAX_CHUNK_SILENCE_RATIO:
+                        is_degenerate = True
+                        degenerate_reason = (
+                            f'{silent_ratio*100:.1f}% silent '
+                            f'(>{CHATTERBOX_MAX_CHUNK_SILENCE_RATIO*100:.0f}%)')
 
                 if is_degenerate:
                     if chunk_retries < CHATTERBOX_CHUNK_MAX_RETRIES:
@@ -324,6 +332,21 @@ def gen_audio_segments_chatterbox(bridge, text, stats=None, max_chunks=None,
                         continue  # retry this chunk
                     print(f'\nChunk {idx}: {degenerate_reason}, accepting after '
                           f'{CHATTERBOX_CHUNK_MAX_RETRIES} retries.')
+
+                # Turbo can leave multi-second dead air inside a chunk (e.g. an
+                # 18 s gap after a sentence) that the head/tail ratio cannot
+                # see. Compress those runs to a natural pause.
+                before = audio.size
+                audio = _compress_internal_silence(
+                    audio,
+                    threshold=CHATTERBOX_SILENCE_THRESHOLD,
+                    max_silence_ms=CHATTERBOX_MAX_INTERNAL_SILENCE_MS,
+                    target_ms=CHATTERBOX_INTERNAL_SILENCE_TARGET_MS,
+                )
+                removed_secs = (before - audio.size) / float(write_sr)
+                if removed_secs >= 3.0:
+                    print(f'\nChunk {idx}: shortened {removed_secs:.1f}s of '
+                          f'internal silence to natural pauses.')
 
                 segments.append(audio)
                 break  # accept this chunk (either good, or max retries reached)

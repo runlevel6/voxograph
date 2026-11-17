@@ -272,10 +272,14 @@ mono float32 → `_apply_fade`, updates stats/ETA from measured throughput, post
 restores separator chars on the last chunk so progress reaches 100 %) ·
 `_is_chatterbox_progress_noise()` / `_CHATTERBOX_NOISE_MARKERS`. Each Turbo chunk is checked for
 degeneration after generation: a `speech_token_count` at Turbo's generation cap
-(`CHATTERBOX_MAX_CHUNK_TOKENS = 1000`, i.e. no stop token was ever emitted) or a silence ratio above
-`CHATTERBOX_MAX_CHUNK_SILENCE_RATIO` retries that chunk up to `CHATTERBOX_CHUNK_MAX_RETRIES = 2`
-times, then accepts it with an explicit "accepting after 2 retries" line. Token count is a duration
-proxy (25 tokens/s), not a quality signal — see §10, 2026-11-16.
+(`CHATTERBOX_MAX_CHUNK_TOKENS = 1000`, i.e. no stop token was ever emitted), an entirely silent
+chunk, or a head/tail silence ratio above `CHATTERBOX_MAX_CHUNK_SILENCE_RATIO` retries that chunk up
+to `CHATTERBOX_CHUNK_MAX_RETRIES = 2` times, then accepts it with an explicit "accepting after 2
+retries" line. Token count is a duration proxy (25 tokens/s), not a quality signal — see §10,
+2026-11-16. After acceptance, `_compress_internal_silence()` (in `utils.py`) shortens near-silent
+runs longer than `CHATTERBOX_MAX_INTERNAL_SILENCE_MS = 1000` to
+`CHATTERBOX_INTERNAL_SILENCE_TARGET_MS = 400` — Turbo can emit multi-second dead air *inside* a
+chunk that the head/tail ratio cannot see (see §10, 2026-11-16 silence entry).
 
 **`tts/kokoro.py`** — `gen_audio_segments()` (spaCy sentences → `KPipeline`, 5 ms fades, stats,
 `stop_event`, `max_sentences` with `>=` — Fix #3) · `gen_text()` (one-shot TTS to WAV).
@@ -466,6 +470,20 @@ There is **no test suite** — verification is `py_compile`, import smoke checks
 ---
 
 ## 10. Recent Changes
+
+- **2026-11-16 — Multi-second internal Chatterbox silences are compressed.** `End of the World`
+  chapter 2 (2,388 chars, 10 chunks) produced a 187 s WAV with **50.5 s of near-silent runs >0.8 s**,
+  including an **18.0 s gap** inside chunk 3 right after "And then, without knowing how it happened,
+  the King's dependency turned to subservience." The degenerate check did not catch it because it
+  measured only head/tail silence (`1 - (last_loud - first_loud)/len`), so an internal gap reports
+  0 %. `_trim_silence` also only trims edges. New `_compress_internal_silence()` (`utils.py`) cuts
+  near-silent runs (`<= 0.005`) longer than `CHATTERBOX_MAX_INTERNAL_SILENCE_MS = 1000` down to
+  `CHATTERBOX_INTERNAL_SILENCE_TARGET_MS = 400`; it runs on every accepted Chatterbox chunk (both
+  models), logs when it removes >=3 s, and the all-silent case is now degenerate (`loud.size == 0`
+  was previously skipped). On the existing chapter 2 WAV this takes 187.2 s → 146.7 s with **zero**
+  runs >1 s (was 12); a stubbed bridge test showed a 1 s + 18 s + 1 s chunk becomes 2.4 s in one
+  call and an all-silent chunk retries exactly `CHATTERBOX_CHUNK_MAX_RETRIES` times. `compileall` +
+  `core`/`ui` imports clean.
 
 - **2026-11-16 — Turbo "degenerate chunk" retries no longer fire on normal chunks.** The
   degenerate-chunk guard added in `fe8cad7` treated any Turbo chunk over `CHATTERBOX_MAX_CHUNK_TOKENS

@@ -123,7 +123,7 @@ CHATTERBOX_DEFAULT_MODEL = CHATTERBOX_MODEL_MULTILINGUAL
 
 # Chatterbox degrades/hallucinates on input longer than this, so whole-book
 # synthesis packs sentences into chunks that approach (but never exceed) it.
-CHATTERBOX_MAX_CHUNK_CHARS = 300
+CHATTERBOX_MAX_CHUNK_CHARS = 290
 
 # How many times a failed fragment is retried (recreating the bridge each time)
 # before the run is ended with CORE_ERROR.
@@ -141,11 +141,22 @@ CHATTERBOX_TURBO_MAX_GEN_LEN = 1000
 # at a normal speaking pace, so any lower threshold would flag most of a book
 # and triple synthesis time for audio that is fine.
 CHATTERBOX_MAX_CHUNK_TOKENS = CHATTERBOX_TURBO_MAX_GEN_LEN
-# If the generated chunk's silence ratio exceeds this, it is degenerate and
-# should be retried. 0.5 = 50% silence.
+# If the generated chunk's head/tail silence ratio exceeds this, it is
+# degenerate and should be retried. 0.5 = 50% silence. This only measures the
+# silent head and tail, not silence inside the chunk (see the internal-silence
+# constants below).
 CHATTERBOX_MAX_CHUNK_SILENCE_RATIO = 0.5
 # Max retries for a single degenerate chunk (distinct from bridge retries).
 CHATTERBOX_CHUNK_MAX_RETRIES = 2
+
+# Chatterbox Turbo also emits multi-second near-silence *inside* a chunk (after
+# a sentence, mid-paragraph), which the head/tail ratio cannot see. Such runs
+# are shortened to a natural pause instead of retrying the chunk: the speech on
+# both sides is intact, so retrying only burns GPU time. The threshold matches
+# `_trim_silence`; runs longer than 1 s are not natural sentence pauses.
+CHATTERBOX_SILENCE_THRESHOLD = 0.005
+CHATTERBOX_MAX_INTERNAL_SILENCE_MS = 1000
+CHATTERBOX_INTERNAL_SILENCE_TARGET_MS = 400
 
 CHATTERBOX_BRIDGE_DIR = Path(
     os.environ.get('VOXOGRAPH_CHATTERBOX_BRIDGE_DIR', '/home/vlad/chatterbox_venv'))
